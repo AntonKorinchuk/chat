@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chat with Support</title>
+    <style>
+        .chat-container {
+            max-width: 600px;
+            margin: 20px auto;
+        }
+        .messages {
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin-bottom: 10px;
+            background: #f9f9f9;
+        }
+        .message {
+            margin: 8px 0;
+            padding: 10px;
+            border-radius: 8px;
+            max-width: 80%;
+            position: relative;
+        }
+        .admin-message {
+            background: #e3f2fd;
+            margin-left: 20%;
+            float: right;
+            clear: both;
+        }
+        .user-message {
+            background: #fff;
+            margin-right: 20%;
+            float: left;
+            clear: both;
+            border: 1px solid #e0e0e0;
+        }
+        .message-header {
+            font-size: 0.8em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .input-area {
+            display: flex;
+            gap: 10px;
+            padding: 10px;
+            background: white;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        #messageInput {
+            flex-grow: 1;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            padding: 8px 20px;
+            background: #2196F3;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #1976D2;
+        }
+        .status {
+            text-align: center;
+            padding: 10px;
+            color: #666;
+        }
+        .clearfix::after {
+            content: "";
+            clear: both;
+            display: table;
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="status" id="status">Connecting...</div>
+        <div class="messages" id="messages"></div>
+        <div class="input-area">
+            <input type="text" id="messageInput" placeholder="Type your message here...">
+            <button onclick="sendMessage()" id="sendButton">Send</button>
+        </div>
+    </div>
+
+    <script>
+        const userId = 'user_' + Math.random().toString(36).substr(2, 9);
+        let ws = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+
+        function connect() {
+            ws = new WebSocket(`ws://localhost:8000/ws/user/${userId}`);
+
+            ws.onopen = function() {
+                document.getElementById('status').innerHTML = 'Connected';
+                document.getElementById('status').style.color = '#4CAF50';
+                reconnectAttempts = 0;
+                enableChat();
+            };
+
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                addMessage(data);
+            };
+
+            ws.onclose = function() {
+                document.getElementById('status').innerHTML = 'Disconnected. Reconnecting...';
+                document.getElementById('status').style.color = '#f44336';
+                disableChat();
+
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    setTimeout(connect, 5000);
+                } else {
+                    document.getElementById('status').innerHTML = 'Connection failed. Please refresh the page.';
+                }
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        function enableChat() {
+            document.getElementById('messageInput').disabled = false;
+            document.getElementById('sendButton').disabled = false;
+        }
+
+        function disableChat() {
+            document.getElementById('messageInput').disabled = true;
+            document.getElementById('sendButton').disabled = true;
+        }
+
+        function addMessage(data) {
+            const messagesDiv = document.getElementById('messages');
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', data.sender === 'admin' ? 'admin-message' : 'user-message');
+
+            const timestamp = new Date(data.timestamp).toLocaleTimeString();
+
+            messageDiv.innerHTML = `
+                <div class="message-header">
+                    ${data.sender} - ${timestamp}
+                </div>
+                <div class="message-content">
+                    ${data.message}
+                </div>
+            `;
+
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.innerHTML += '<div class="clearfix"></div>';
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function sendMessage() {
+            const messageInput = document.getElementById('messageInput');
+            const message = messageInput.value.trim();
+
+            if (message && ws && ws.readyState === WebSocket.OPEN) {
+                // Display the user's message immediately
+                addMessage({
+                    sender: 'user',
+                    message: message,
+                    timestamp: new Date().toISOString()
+                });
+
+                // Send the message to the WebSocket server
+                ws.send(JSON.stringify({
+                    message: message
+                }));
+
+                messageInput.value = '';
+            }
+        }
+
+        // Handle Enter key
+        document.getElementById('messageInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        // Initial connection
+        connect();
+    </script>
+</body>
+</html>
