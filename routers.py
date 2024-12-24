@@ -1,186 +1,358 @@
-from fastapi import (
-    WebSocket,
-    WebSocketDisconnect,
-    HTTPException,
-    Request,
-    APIRouter,
-    FastAPI,
-)
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
-import requests
+import json
 from datetime import datetime
 
-from config import TELEGRAM_API_URL
-from managers import ConnectionManager
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Header, HTTPException, Request
+from typing import Optional, Union
 
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+
+from managers import ConnectionManager, Message, User, UserType
 
 router = APIRouter()
-
+manager = ConnectionManager()
 templates = Jinja2Templates(directory="templates")
 
-manager = ConnectionManager()
+
+class StaffRegistration(BaseModel):
+    user_type: str
+    name: str
 
 
-class Message(BaseModel):
-    chat_id: int
-    text: str
-    sender: str
-    timestamp: datetime
+class CustomerRegistration(BaseModel):
+    name: str
+    phone: str
 
 
-async def send_telegram_message(chat_id: int, text: str) -> bool:
+async def get_token(
+        websocket: WebSocket,
+        api_key: Optional[str] = None,
+        phone: Optional[str] = None,
+) -> Union[User, None]:
+    if not api_key and not phone:
+        return None
+
+    if api_key:
+        user = manager.get_user_by_api_key(api_key)
+        if user:
+            return user
+
+    if phone:
+        user = manager.get_user_by_phone(phone)
+        if user:
+            return user
+
+    return None
+
+
+@router.websocket("/ws/{user_id}")
+async def websocket_endpoint(
+        websocket: WebSocket,
+        user_id: str,
+        api_key: Optional[str] = None,
+        phone: Optional[str] = None
+):
+    user = await get_token(websocket, api_key, phone)
+    if not user:
+        await websocket.close(code=4001, reason="Authentication failed")
+        return
+
+    if user.id != user_id:
+        await websocket.close(code=4002, reason="Invalid user ID")
+        return
+
+    await manager.connect(websocket, user_id)
+
     try:
-        response = requests.post(
-            f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text}
-        )
-        response.raise_for_status()
-        return True
+        while True:
+            data = await websocket.receive_json()
+
+            to_user_id = data.get("to_user")
+            content = data.get("content")
+
+            if not all([to_user_id, content]):
+                await websocket.send_json({
+                    "error": True,
+                    "message": "Missing required fields"
+                })
+                continue
+
+            message = Message(
+                from_user=user_id,
+                to_user=to_user_id,
+                content=content,
+                timestamp=datetime.now()
+            )
+
+            await manager.send_message(message)
+
+    except WebSocketDisconnect:
+        await manager.disconnect(user_id)
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
-        return False
-
-
-# WebSocket endpoints
-@router.websocket("/ws/admin")
-async def admin_websocket(websocket: WebSocket):
-    await manager.connect_admin(websocket)
-    try:
-        while True:
-            data = await websocket.receive_json()
-            user_id = data.get("user_id")
-            message = data.get("message")
-            message_type = data.get("type", "web")
-
-            if not all([user_id, message]):
-                continue
-
-            message_obj = {
-                "user_id": user_id,
-                "message": message,
-                "sender": "admin",
-                "timestamp": datetime.now().isoformat(),
-            }
-
-            manager.store_message(user_id, message_obj)
-
-            if message_type == "telegram":
-                telegram_chat_id = None
-                for chat_id, uid in manager.telegram_chat_ids.items():
-                    if uid == user_id:
-                        telegram_chat_id = chat_id
-                        break
-
-                if telegram_chat_id:
-                    success = await send_telegram_message(telegram_chat_id, message)
-                    if not success:
-                        await websocket.send_json(
-                            {
-                                "error": True,
-                                "message": "Failed to send Telegram message",
-                            }
-                        )
-            else:
-                await manager.send_to_user(user_id, message_obj)
-
-    except WebSocketDisconnect:
-        manager.disconnect_admin(websocket)
-
-
-@router.websocket("/ws/user/{user_id}")
-async def user_websocket(websocket: WebSocket, user_id: str):
-    await manager.connect_user(websocket, user_id)
-    try:
-        while True:
-            data = await websocket.receive_json()
-            message = data.get("message")
-
-            if not message:
-                continue
-
-            message_obj = {
-                "user_id": user_id,
-                "message": message,
-                "sender": "user",
-                "timestamp": datetime.now().isoformat(),
-            }
-
-            manager.store_message(user_id, message_obj)
-            await manager.broadcast_to_admins(message_obj)
-
-    except WebSocketDisconnect:
-        manager.disconnect_user(user_id)
+        print(f"Error in websocket: {str(e)}")
+        await websocket.close(code=4000, reason="Internal server error")
 
 
 @router.post("/")
-async def webhook_handler(update: dict):
+async def telegram_webhook(update: dict):
+    print(f"Received telegram update: {json.dumps(update, indent=2)}")
+
+    if "message" not in update:
+        print("No message in update")
+        return {"status": "ignored"}
+
     try:
-        print("Received update:", update)
+        chat_id = update["message"]["chat"]["id"]
+        text = update["message"].get("text", "")
+        username = update["message"]["from"].get("username", "Unknown")
 
-        if "message" in update:
-            chat_id = update["message"]["chat"]["id"]
-            sender_name = update["message"].get("from", {}).get("first_name", "Unknown")
-
-            if "text" not in update["message"]:
-                print("Message does not contain text. Skipping.")
-                return {"status": "skipped", "reason": "no text in message"}
-
-            message_text = update["message"]["text"]
-
-            user_id = f"telegram_{chat_id}"
-            manager.register_telegram_user(chat_id, user_id)
-
-            message_obj = {
-                "user_id": user_id,
-                "message": message_text,
-                "sender": f"telegram_user_{sender_name}",
-                "timestamp": datetime.now().isoformat(),
-                "platform": "telegram",
-            }
-
-            manager.store_message(user_id, message_obj)
-
-            await manager.broadcast_to_admins(message_obj)
-
-        elif "my_chat_member" in update:
-            chat_id = update["my_chat_member"]["chat"]["id"]
-            new_status = update["my_chat_member"]["new_chat_member"]["status"]
-            old_status = update["my_chat_member"]["old_chat_member"]["status"]
-
-            print(
-                f"Bot membership status changed: {old_status} -> {new_status} in chat {chat_id}"
+        user = manager.get_user_by_telegram_id(chat_id)
+        if not user:
+            user = User(
+                id=f"telegram_{chat_id}",
+                type=UserType.CUSTOMER,
+                telegram_id=chat_id,
+                name=username
             )
+            await manager.register_user(user)
+            print(f"Created new user: {user}")
 
-        else:
-            print("Received update of unsupported type:", update)
+        message = Message(
+            from_user=user.id,
+            to_user="admin",
+            content=text,
+            timestamp=datetime.now(),
+            source="telegram"
+        )
+
+        success = await manager.send_message_to_active_admin(message)
+        print(f"Message sent to admin: {success}")
+
+        if not success:
+            print("No active admins available")
+            return {"status": "no_active_admins"}
 
         return {"status": "success"}
+
     except Exception as e:
-        print(f"Error in webhook handler: {e}")
-        raise HTTPException(status_code=400, detail="Invalid webhook payload")
+        print(f"Error processing telegram webhook: {str(e)}")
+        return {"status": "error", "detail": str(e)}
 
 
-@router.get("/messages/{user_id}")
-async def get_messages(user_id: str):
-    messages = manager.message_history.get(user_id, [])
-    return {"user_id": user_id, "messages": messages}
+@router.post("/register/staff")
+async def register_staff(
+        data: StaffRegistration,
+        api_key: str = Header(...)
+):
+    try:
+        if data.user_type not in ["admin", "mechanic"]:
+            raise HTTPException(status_code=400, detail="Invalid user type")
+
+        user = User(
+            id=f"{data.user_type}_{data.name}",
+            type=UserType[data.user_type.upper()],
+            api_key=api_key
+        )
+        await manager.register_user(user)
+        return {
+            "status": "success",
+            "user_id": user.id,
+            "message": f"Successfully registered {data.user_type} {data.name}"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/active-users")
-async def get_active_users():
-    web_users = list(manager.user_connections.keys())
-    telegram_users = [
-        f"telegram_{chat_id}" for chat_id in manager.telegram_chat_ids.keys()
+@router.post("/register/customer")
+async def register_customer(
+        data: CustomerRegistration
+):
+    try:
+        user = User(
+            id=f"customer_{data.phone}",
+            type=UserType.CUSTOMER,
+            phone=data.phone
+        )
+        await manager.register_user(user)
+        return {
+            "status": "success",
+            "user_id": user.id,
+            "message": f"Successfully registered customer {data.name}"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/messages/manager-history")
+async def get_manager_message_history(
+    target_type: str,  # "mechanic", "customer"
+    target_identifier: str,  # api_key for mechanic, phone/telegram_id for customer
+    api_key: str = Header(...)
+):
+    """Get complete message history between a manager and a target user (mechanic or customer)"""
+    # Verify the requesting manager
+    manager_user = manager.get_user_by_api_key(api_key)
+    if not manager_user or manager_user.type != UserType.ADMIN:
+        raise HTTPException(status_code=403, detail="Invalid manager credentials")
+
+    target_user = None
+    if target_type == "mechanic":
+        target_user = manager.get_user_by_api_key(target_identifier)
+        if not target_user or target_user.type != UserType.MECHANIC:
+            raise HTTPException(status_code=404, detail="Mechanic not found")
+    elif target_type == "customer":
+        # Try phone first
+        target_user = manager.get_user_by_phone(target_identifier)
+        if not target_user:
+            # Try telegram id
+            try:
+                telegram_id = int(target_identifier)
+                target_user = manager.get_user_by_telegram_id(telegram_id)
+            except ValueError:
+                pass
+        if not target_user or target_user.type != UserType.CUSTOMER:
+            raise HTTPException(status_code=404, detail="Customer not found")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid target type")
+
+    sent_messages = [
+        msg.to_json() for msg in manager.message_history.get(manager_user.id, [])
+        if msg.to_user == target_user.id
     ]
-    return {"users": list(set(web_users + telegram_users))}
+
+    received_messages = [
+        msg.to_json() for msg in manager.message_history.get(target_user.id, [])
+        if msg.to_user == manager_user.id
+    ]
+
+    all_messages = sorted(
+        sent_messages + received_messages,
+        key=lambda x: datetime.fromisoformat(x['timestamp'])
+    )
+
+    return {
+        "status": "success",
+        "messages": all_messages
+    }
+
+@router.get("/messages/mechanic-history")
+async def get_mechanic_message_history(
+    target_type: str,  # "manager", "customer"
+    target_identifier: str,
+    api_key: str = Header(...)
+):
+    """Get complete message history between a mechanic and a target user (manager or customer)"""
+    # Verify the requesting mechanic
+    mechanic_user = manager.get_user_by_api_key(api_key)
+    if not mechanic_user or mechanic_user.type != UserType.MECHANIC:
+        raise HTTPException(status_code=403, detail="Invalid mechanic credentials")
+
+    # Get the target user based on type
+    target_user = None
+    if target_type == "manager":
+        target_user = manager.get_user_by_api_key(target_identifier)
+        if not target_user or target_user.type != UserType.ADMIN:
+            raise HTTPException(status_code=404, detail="Manager not found")
+    elif target_type == "customer":
+        # Try phone first
+        target_user = manager.get_user_by_phone(target_identifier)
+        if not target_user:
+            # Try telegram id
+            try:
+                telegram_id = int(target_identifier)
+                target_user = manager.get_user_by_telegram_id(telegram_id)
+            except ValueError:
+                pass
+        if not target_user or target_user.type != UserType.CUSTOMER:
+            raise HTTPException(status_code=404, detail="Customer not found")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid target type")
+
+    # Get messages sent by mechanic to target
+    sent_messages = [
+        msg.to_json() for msg in manager.message_history.get(mechanic_user.id, [])
+        if msg.to_user == target_user.id
+    ]
+
+    # Get messages received by mechanic from target
+    received_messages = [
+        msg.to_json() for msg in manager.message_history.get(target_user.id, [])
+        if msg.to_user == mechanic_user.id
+    ]
+
+    # Combine and sort all messages by timestamp
+    all_messages = sorted(
+        sent_messages + received_messages,
+        key=lambda x: datetime.fromisoformat(x['timestamp'])
+    )
+
+    return {
+        "status": "success",
+        "messages": all_messages
+    }
 
 
-@router.get("/", response_class=HTMLResponse)
-async def get_user_page(request: Request):
-    return templates.TemplateResponse("user.html", {"request": request})
+@router.get("/messages/customer-history")
+async def get_customer_message_history(
+    target_type: str,  # "manager", "mechanic"
+    target_identifier: str,  # api_key
+    identifier: str,
+    identifier_type: str = "phone"  # Can be "phone" or "telegram"
+):
+    """Get complete message history between a customer and a target user (manager or mechanic)"""
+    # Get the customer based on identifier type
+    customer_user = None
+    if identifier_type == "phone":
+        customer_user = manager.get_user_by_phone(identifier)
+    elif identifier_type == "telegram":
+        try:
+            telegram_id = int(identifier)
+            customer_user = manager.get_user_by_telegram_id(telegram_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Telegram ID format")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid identifier type")
+
+    if not customer_user or customer_user.type != UserType.CUSTOMER:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Get the target user based on type
+    target_user = None
+    if target_type == "manager":
+        target_user = manager.get_user_by_api_key(target_identifier)
+        if not target_user or target_user.type != UserType.ADMIN:
+            raise HTTPException(status_code=404, detail="Manager not found")
+    elif target_type == "mechanic":
+        target_user = manager.get_user_by_api_key(target_identifier)
+        if not target_user or target_user.type != UserType.MECHANIC:
+            raise HTTPException(status_code=404, detail="Mechanic not found")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid target type")
+
+    # Get messages sent by customer to target
+    sent_messages = [
+        msg.to_json() for msg in manager.message_history.get(customer_user.id, [])
+        if msg.to_user == target_user.id
+    ]
+
+    # Get messages received by customer from target
+    received_messages = [
+        msg.to_json() for msg in manager.message_history.get(target_user.id, [])
+        if msg.to_user == customer_user.id
+    ]
+
+    # Combine and sort all messages by timestamp
+    all_messages = sorted(
+        sent_messages + received_messages,
+        key=lambda x: datetime.fromisoformat(x['timestamp'])
+    )
+
+    return {
+        "status": "success",
+        "messages": all_messages
+    }
 
 
-@router.get("/admin", response_class=HTMLResponse)
-async def get_admin_page(request: Request):
-    return templates.TemplateResponse("admin.html", {"request": request})
+@router.get("/test")
+async def test_page(request: Request):
+    return templates.TemplateResponse("test.html", {"request": request})

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chat Test Interface</title>
+    <style>
+        .container { max-width: 800px; margin: 20px auto; padding: 20px; }
+        .panel { border: 1px solid #ccc; padding: 15px; margin: 10px 0; }
+        .messages { height: 200px; overflow-y: auto; border: 1px solid #eee; padding: 10px; margin: 10px 0; }
+        .input-group { margin: 10px 0; }
+        label { display: block; margin: 5px 0; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <!-- Registration Panel -->
+    <div class="panel">
+        <h3>1. Registration</h3>
+
+        <div class="input-group">
+            <h4>Register Staff (Admin/Mechanic)</h4>
+            <label>Name: <input type="text" id="staffName"></label>
+            <label>API Key: <input type="text" id="apiKey"></label>
+            <label>Type:
+                <select id="userType">
+                    <option value="admin">Admin</option>
+                    <option value="mechanic">Mechanic</option>
+                </select>
+            </label>
+            <button onclick="registerStaff()">Register Staff</button>
+        </div>
+
+        <div class="input-group">
+            <h4>Register Customer</h4>
+            <label>Name: <input type="text" id="customerName"></label>
+            <label>Phone: <input type="text" id="phone"></label>
+            <button onclick="registerCustomer()">Register Customer</button>
+        </div>
+    </div>
+
+    <!-- Connection Panel -->
+    <div class="panel">
+        <h3>2. WebSocket Connection</h3>
+        <div class="input-group">
+            <label>User ID: <input type="text" id="userId"></label>
+            <label>Authentication: <input type="text" id="authValue" placeholder="API Key or Phone"></label>
+            <label>Auth Type:
+                <select id="authType">
+                    <option value="api-key">API Key</option>
+                    <option value="phone">Phone</option>
+                </select>
+            </label>
+            <button onclick="connect()" id="connectBtn">Connect</button>
+            <button onclick="disconnect()" id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+    </div>
+
+    <!-- Messaging Panel -->
+    <div class="panel">
+        <h3>3. Messaging</h3>
+        <div class="messages" id="messageArea"></div>
+        <div class="input-group">
+            <label>To User ID: <input type="text" id="toUser"></label>
+            <label>Message: <input type="text" id="messageInput"></label>
+            <button onclick="sendMessage()" id="sendBtn" disabled>Send Message</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    let ws = null;
+
+    async function registerStaff() {
+        const name = document.getElementById('staffName').value;
+        const apiKey = document.getElementById('apiKey').value;
+        const userType = document.getElementById('userType').value;
+
+        if (!name || !apiKey) {
+            log('Please fill in all fields', 'error');
+            return;
+        }
+
+        try {
+            const response = await fetch('/register/staff', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': apiKey
+                },
+                body: JSON.stringify({
+                    user_type: userType,
+                    name: name
+                })
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                log(`Staff registration successful: ${data.message}`, 'success');
+                log(`Your user ID is: ${data.user_id}`, 'success');
+            } else {
+                log(`Registration error: ${data.detail}`, 'error');
+            }
+        } catch (error) {
+            log(`Error registering staff: ${error}`, 'error');
+        }
+    }
+
+    async function registerCustomer() {
+        const name = document.getElementById('customerName').value;
+        const phone = document.getElementById('phone').value;
+
+        if (!name || !phone) {
+            log('Please fill in all fields', 'error');
+            return;
+        }
+
+        try {
+            const response = await fetch('/register/customer', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    name: name,
+                    phone: phone
+                })
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                log(`Customer registration successful: ${data.message}`, 'success');
+                log(`Your user ID is: ${data.user_id}`, 'success');
+            } else {
+                log(`Registration error: ${data.detail}`, 'error');
+            }
+        } catch (error) {
+            log(`Error registering customer: ${error}`, 'error');
+        }
+    }
+
+    function connect() {
+    const userId = document.getElementById('userId').value;
+    const authValue = document.getElementById('authValue').value;
+    const authType = document.getElementById('authType').value;
+
+    if (!userId || !authValue) {
+        log('Please fill in all connection fields', 'error');
+        return;
+    }
+
+    // Формуємо URL з параметрами аутентифікації
+    const wsUrl = new URL(`ws://${window.location.host}/ws/${userId}`);
+    if (authType === 'api-key') {
+        wsUrl.searchParams.append('api_key', authValue);
+    } else {
+        wsUrl.searchParams.append('phone', authValue);
+    }
+
+    // Створюємо WebSocket з'єднання
+    ws = new WebSocket(wsUrl.href);
+
+    ws.onopen = () => {
+        log('Connected to WebSocket', 'success');
+        document.getElementById('connectBtn').disabled = true;
+        document.getElementById('disconnectBtn').disabled = false;
+        document.getElementById('sendBtn').disabled = false;
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const message = JSON.parse(event.data);
+            if (message.error) {
+                log(`Error: ${message.message}`, 'error');
+            } else {
+                log(`Received: ${JSON.stringify(message)}`);
+            }
+        } catch (e) {
+            log(`Error parsing message: ${e}`, 'error');
+        }
+    };
+
+    ws.onclose = (event) => {
+        let reason = "Unknown reason";
+        if (event.code === 4001) {
+            reason = "Authentication failed";
+        } else if (event.code === 4002) {
+            reason = "Invalid user ID";
+        } else if (event.code === 1000) {
+            reason = "Normal closure";
+        }
+        log(`Disconnected from WebSocket: ${reason}`, event.code === 1000 ? 'info' : 'error');
+        document.getElementById('connectBtn').disabled = false;
+        document.getElementById('disconnectBtn').disabled = true;
+        document.getElementById('sendBtn').disabled = true;
+    };
+
+    ws.onerror = (error) => {
+        log(`WebSocket error occurred`, 'error');
+        console.error('WebSocket error:', error);
+    };
+}
+
+    function disconnect() {
+        if (ws) {
+            ws.close();
+            ws = null;
+        }
+    }
+
+    function sendMessage() {
+        if (!ws) {
+            log('Not connected!', 'error');
+            return;
+        }
+
+        const toUser = document.getElementById('toUser').value;
+        const message = document.getElementById('messageInput').value;
+
+        if (!toUser || !message) {
+            log('Please fill in both recipient and message', 'error');
+            return;
+        }
+
+        const messageObj = {
+            to_user: toUser,
+            content: message
+        };
+
+        ws.send(JSON.stringify(messageObj));
+        log(`Sent: ${JSON.stringify(messageObj)}`);
+        document.getElementById('messageInput').value = '';
+    }
+
+    function log(message, type = 'info') {
+        const messageArea = document.getElementById('messageArea');
+        const time = new Date().toLocaleTimeString();
+        const className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
+        messageArea.innerHTML += `<div class="${className}">[${time}] ${message}</div>`;
+        messageArea.scrollTop = messageArea.scrollHeight;
+    }
+</script>
+</body>
+</html>
