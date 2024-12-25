@@ -1,4 +1,3 @@
-import json
 import os
 from datetime import datetime
 
@@ -50,30 +49,31 @@ async def get_token(
 
 
 async def download_telegram_file(file_id: str) -> tuple[bytes, str, str]:
-    """Download file from Telegram and return its content, filename and mime type"""
-    # Get file path first
     url = f"{TELEGRAM_API_URL}/getFile"
     params = {"file_id": file_id}
     response = requests.get(url, params=params)
     response.raise_for_status()
 
-    file_path = response.json()["result"]["file_path"]
-    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    file_info = response.json()["result"]
+    file_path = file_info["file_path"]
 
-    # Download the actual file
-    response = requests.get(download_url)
+    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    response = requests.get(download_url, stream=True)
     response.raise_for_status()
 
-    # Get filename and mime type
-    content_disp = response.headers.get('content-disposition', '')
-    if 'filename=' in content_disp:
-        filename = content_disp.split('filename=')[1].strip('"')
-    else:
-        filename = f"{file_id}_{file_path.split('/')[-1]}"
+    ext = os.path.splitext(file_path)[1]
+    if not ext:
+        mime_type = response.headers.get('content-type', 'application/octet-stream')
+        mime_to_ext = {
+            'video/mp4': '.mp4',
+            'audio/mpeg': '.mp3',
+            'audio/ogg': '.ogg',
+            'image/jpeg': '.jpg',
+            'image/png': '.png'
+        }
+        ext = mime_to_ext.get(mime_type, '')
 
-    mime_type = response.headers.get('content-type', 'application/octet-stream')
-
-    return response.content, filename, mime_type
+    return response.content, file_path, response.headers.get('content-type', 'application/octet-stream')
 
 
 @router.websocket("/ws/{user_id}")
@@ -153,10 +153,9 @@ async def telegram_webhook(update: dict):
         file_name = None
         mime_type = None
 
-        # Photo handling
         if "photo" in update["message"]:
             message_type = MessageType.IMAGE
-            photo = update["message"]["photo"][-1]  # Get highest quality
+            photo = update["message"]["photo"][-1]
             file_id = photo["file_id"]
             file_content, _, mime_type = await download_telegram_file(file_id)
             file_path, relative_path = await FileManager.save_telegram_file(
@@ -165,9 +164,21 @@ async def telegram_webhook(update: dict):
                 message_type
             )
             content = update["message"].get("caption", "Image")
-            file_name = f"{file_id}_file.jpg"
+            file_name = photo.get("file_name", f"{file_id}.jpg")
 
-        # Voice message handling
+        elif "audio" in update["message"]:
+            message_type = MessageType.AUDIO
+            audio = update["message"]["audio"]
+            file_id = audio["file_id"]
+            file_content, _, mime_type = await download_telegram_file(file_id)
+            file_path, relative_path = await FileManager.save_telegram_file(
+                file_content,
+                file_id,
+                message_type
+            )
+            content = update["message"].get("caption", "Audio")
+            file_name = audio.get("file_name", f"{file_id}.mp3")
+
         elif "voice" in update["message"]:
             message_type = MessageType.VOICE
             voice = update["message"]["voice"]
@@ -179,7 +190,33 @@ async def telegram_webhook(update: dict):
                 message_type
             )
             content = "Voice message"
-            file_name = f"{file_id}_file.oga"
+            file_name = voice.get("file_name", f"{file_id}.ogg")
+
+        elif "video" in update["message"]:
+            message_type = MessageType.VIDEO
+            video = update["message"]["video"]
+            file_id = video["file_id"]
+            file_content, _, mime_type = await download_telegram_file(file_id)
+            file_path, relative_path = await FileManager.save_telegram_file(
+                file_content,
+                file_id,
+                message_type
+            )
+            content = update["message"].get("caption", "Video")
+            file_name = video.get("file_name", f"{file_id}.mp4")
+
+        elif "document" in update["message"]:
+            message_type = MessageType.FILE
+            document = update["message"]["document"]
+            file_id = document["file_id"]
+            file_content, _, mime_type = await download_telegram_file(file_id)
+            file_path, relative_path = await FileManager.save_telegram_file(
+                file_content,
+                file_id,
+                message_type
+            )
+            content = update["message"].get("caption", "Document")
+            file_name = document.get("file_name", f"{file_id}_file")
 
         message = Message(
             from_user=user.id,
@@ -265,10 +302,10 @@ async def get_manager_message_history(
         if not target_user or target_user.type != UserType.MECHANIC:
             raise HTTPException(status_code=404, detail="Mechanic not found")
     elif target_type == "customer":
-        # Try phone first
+
         target_user = manager.get_user_by_phone(target_identifier)
         if not target_user:
-            # Try telegram id
+
             try:
                 telegram_id = int(target_identifier)
                 target_user = manager.get_user_by_telegram_id(telegram_id)
@@ -307,22 +344,18 @@ async def get_mechanic_message_history(
     api_key: str = Header(...)
 ):
     """Get complete message history between a mechanic and a target user (manager or customer)"""
-    # Verify the requesting mechanic
     mechanic_user = manager.get_user_by_api_key(api_key)
     if not mechanic_user or mechanic_user.type != UserType.MECHANIC:
         raise HTTPException(status_code=403, detail="Invalid mechanic credentials")
 
-    # Get the target user based on type
     target_user = None
     if target_type == "manager":
         target_user = manager.get_user_by_api_key(target_identifier)
         if not target_user or target_user.type != UserType.ADMIN:
             raise HTTPException(status_code=404, detail="Manager not found")
     elif target_type == "customer":
-        # Try phone first
         target_user = manager.get_user_by_phone(target_identifier)
         if not target_user:
-            # Try telegram id
             try:
                 telegram_id = int(target_identifier)
                 target_user = manager.get_user_by_telegram_id(telegram_id)
@@ -333,19 +366,17 @@ async def get_mechanic_message_history(
     else:
         raise HTTPException(status_code=400, detail="Invalid target type")
 
-    # Get messages sent by mechanic to target
     sent_messages = [
         msg.to_json() for msg in manager.message_history.get(mechanic_user.id, [])
         if msg.to_user == target_user.id
     ]
 
-    # Get messages received by mechanic from target
     received_messages = [
         msg.to_json() for msg in manager.message_history.get(target_user.id, [])
         if msg.to_user == mechanic_user.id
     ]
 
-    # Combine and sort all messages by timestamp
+
     all_messages = sorted(
         sent_messages + received_messages,
         key=lambda x: datetime.fromisoformat(x['timestamp'])
@@ -365,7 +396,6 @@ async def get_customer_message_history(
     identifier_type: str = "phone"  # Can be "phone" or "telegram"
 ):
     """Get complete message history between a customer and a target user (manager or mechanic)"""
-    # Get the customer based on identifier type
     customer_user = None
     if identifier_type == "phone":
         customer_user = manager.get_user_by_phone(identifier)
@@ -381,7 +411,6 @@ async def get_customer_message_history(
     if not customer_user or customer_user.type != UserType.CUSTOMER:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    # Get the target user based on type
     target_user = None
     if target_type == "manager":
         target_user = manager.get_user_by_api_key(target_identifier)
@@ -394,19 +423,16 @@ async def get_customer_message_history(
     else:
         raise HTTPException(status_code=400, detail="Invalid target type")
 
-    # Get messages sent by customer to target
     sent_messages = [
         msg.to_json() for msg in manager.message_history.get(customer_user.id, [])
         if msg.to_user == target_user.id
     ]
 
-    # Get messages received by customer from target
     received_messages = [
         msg.to_json() for msg in manager.message_history.get(target_user.id, [])
         if msg.to_user == customer_user.id
     ]
 
-    # Combine and sort all messages by timestamp
     all_messages = sorted(
         sent_messages + received_messages,
         key=lambda x: datetime.fromisoformat(x['timestamp'])
@@ -422,6 +448,7 @@ async def get_customer_message_history(
 async def test_page(request: Request):
     return templates.TemplateResponse("test.html", {"request": request})
 
+
 @router.post("/upload/{message_type}")
 async def upload_file(
     message_type: str,
@@ -431,7 +458,6 @@ async def upload_file(
     phone: Optional[str] = Header(None)
 ):
     """Upload media file and send it as a message"""
-    # Validate user
     user = await get_token(None, api_key, phone)
     if not user:
         raise HTTPException(status_code=403, detail="Authentication failed")
@@ -441,7 +467,7 @@ async def upload_file(
     except KeyError:
         raise HTTPException(status_code=400, detail="Invalid message type")
 
-    # Validate and save file
+
     FileManager.validate_file(file, msg_type)
     filepath, filename = await FileManager.save_file(file, msg_type)
 
@@ -449,7 +475,7 @@ async def upload_file(
     message = Message(
         from_user=user.id,
         to_user=to_user,
-        content=file.filename,  # Original filename as content
+        content=file.filename,
         timestamp=datetime.now(),
         message_type=msg_type,
         file_path=filepath,
@@ -457,7 +483,7 @@ async def upload_file(
         mime_type=file.content_type
     )
 
-    # Send message
+
     await manager.send_message(message)
 
     return {"status": "success", "message": message.to_json()}
@@ -471,8 +497,19 @@ async def get_file(message_type: str, filename: str):
     except KeyError:
         raise HTTPException(status_code=400, detail="Invalid message type")
 
+
     filepath = os.path.join(UPLOAD_DIR, msg_type.value, filename)
+
     if not os.path.exists(filepath):
+
+        print(f"File not found: {filepath}")
+
+        if '_' in filename:
+            simple_filename = filename.split('_', 1)[1]
+            alternative_path = os.path.join(UPLOAD_DIR, msg_type.value, simple_filename)
+            if os.path.exists(alternative_path):
+                return FileResponse(alternative_path)
+
         raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(filepath)

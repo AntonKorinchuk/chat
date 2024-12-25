@@ -109,15 +109,6 @@ class ConnectionManager:
         await self.send_message(message)
         return True
 
-    async def send_telegram_message(self, chat_id: int, text: str):
-        url = f"{TELEGRAM_API_URL}/sendMessage"
-        data = {
-            "chat_id": chat_id,
-            "text": text
-        }
-        response = requests.post(url, json=data)
-        return response.json()
-
     async def connect(self, websocket: WebSocket, user_id: str) -> None:
         await websocket.accept()
         self.connections[user_id] = websocket
@@ -239,7 +230,6 @@ class FileManager:
     @staticmethod
     async def save_file(file: UploadFile, message_type: MessageType) -> tuple[str, str]:
         """Save uploaded file and return its path and filename"""
-
         type_dir = os.path.join(UPLOAD_DIR, message_type.value)
         os.makedirs(type_dir, exist_ok=True)
 
@@ -271,17 +261,22 @@ class FileManager:
 
     @staticmethod
     async def save_telegram_file(content: bytes, file_id: str, message_type: MessageType) -> tuple[str, str]:
-        """
-        Save file received from Telegram and return its path and filename
-        Returns: (file_path, relative_path)
-        """
         type_dir = os.path.join(UPLOAD_DIR, message_type.value)
         os.makedirs(type_dir, exist_ok=True)
 
-        filename = f"{file_id}_file.jpg"
+        extensions = {
+            MessageType.IMAGE: '.jpg',
+            MessageType.VIDEO: '.mp4',
+            MessageType.AUDIO: '.mp3',
+            MessageType.VOICE: '.ogg',
+            MessageType.FILE: ''
+        }
+        ext = extensions.get(message_type, '')
+
+        filename = f"{file_id}{ext}"
         filepath = os.path.join(type_dir, filename)
 
-        relative_path = f"{message_type.value}/{filename}"
+        relative_path = filename
 
         async with aiofiles.open(filepath, 'wb') as out_file:
             await out_file.write(content)
