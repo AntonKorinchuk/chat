@@ -5,11 +5,20 @@
     <style>
         .container { max-width: 800px; margin: 20px auto; padding: 20px; }
         .panel { border: 1px solid #ccc; padding: 15px; margin: 10px 0; }
-        .messages { height: 200px; overflow-y: auto; border: 1px solid #eee; padding: 10px; margin: 10px 0; }
+        .messages { height: 300px; overflow-y: auto; border: 1px solid #eee; padding: 10px; margin: 10px 0; }
         .input-group { margin: 10px 0; }
         label { display: block; margin: 5px 0; }
         .error { color: red; }
         .success { color: green; }
+        .message-content { margin: 5px 0; }
+        .media-preview { max-width: 200px; max-height: 200px; margin: 5px 0; }
+        .file-upload { margin: 10px 0; padding: 10px; border: 1px dashed #ccc; }
+        .media-message { display: flex; align-items: center; margin: 5px 0; }
+        .media-message img, .media-message video, .media-message audio {
+            max-width: 150px;
+            max-height: 150px;
+            margin-right: 10px;
+        }
     </style>
 </head>
 <body>
@@ -56,13 +65,30 @@
         </div>
     </div>
 
-    <!-- Messaging Panel -->
+    <!-- Messaging Panel with File Upload -->
     <div class="panel">
         <h3>3. Messaging</h3>
         <div class="messages" id="messageArea"></div>
         <div class="input-group">
             <label>To User ID: <input type="text" id="toUser"></label>
             <label>Message: <input type="text" id="messageInput"></label>
+
+            <!-- File Upload Section -->
+            <div class="file-upload">
+                <label>Message Type:
+                    <select id="messageType">
+                        <option value="text">Text</option>
+                        <option value="image">Image</option>
+                        <option value="audio">Audio</option>
+                        <option value="video">Video</option>
+                        <option value="voice">Voice</option>
+                        <option value="file">File</option>
+                    </select>
+                </label>
+                <label>File: <input type="file" id="fileInput"></label>
+                <div id="mediaPreview"></div>
+            </div>
+
             <button onclick="sendMessage()" id="sendBtn" disabled>Send Message</button>
         </div>
     </div>
@@ -142,66 +168,64 @@
     }
 
     function connect() {
-    const userId = document.getElementById('userId').value;
-    const authValue = document.getElementById('authValue').value;
-    const authType = document.getElementById('authType').value;
+        const userId = document.getElementById('userId').value;
+        const authValue = document.getElementById('authValue').value;
+        const authType = document.getElementById('authType').value;
 
-    if (!userId || !authValue) {
-        log('Please fill in all connection fields', 'error');
-        return;
-    }
+        if (!userId || !authValue) {
+            log('Please fill in all connection fields', 'error');
+            return;
+        }
 
-    // Формуємо URL з параметрами аутентифікації
-    const wsUrl = new URL(`ws://${window.location.host}/ws/${userId}`);
-    if (authType === 'api-key') {
-        wsUrl.searchParams.append('api_key', authValue);
-    } else {
-        wsUrl.searchParams.append('phone', authValue);
-    }
+        const wsUrl = new URL(`ws://${window.location.host}/ws/${userId}`);
+        if (authType === 'api-key') {
+            wsUrl.searchParams.append('api_key', authValue);
+        } else {
+            wsUrl.searchParams.append('phone', authValue);
+        }
 
-    // Створюємо WebSocket з'єднання
-    ws = new WebSocket(wsUrl.href);
+        ws = new WebSocket(wsUrl.href);
 
-    ws.onopen = () => {
-        log('Connected to WebSocket', 'success');
-        document.getElementById('connectBtn').disabled = true;
-        document.getElementById('disconnectBtn').disabled = false;
-        document.getElementById('sendBtn').disabled = false;
-    };
+        ws.onopen = () => {
+            log('Connected to WebSocket', 'success');
+            document.getElementById('connectBtn').disabled = true;
+            document.getElementById('disconnectBtn').disabled = false;
+            document.getElementById('sendBtn').disabled = false;
+        };
 
-    ws.onmessage = (event) => {
-        try {
-            const message = JSON.parse(event.data);
-            if (message.error) {
-                log(`Error: ${message.message}`, 'error');
-            } else {
-                log(`Received: ${JSON.stringify(message)}`);
+        ws.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                if (message.error) {
+                    log(`Error: ${message.message}`, 'error');
+                } else {
+                    log(message);
+                }
+            } catch (e) {
+                log(`Error parsing message: ${e}`, 'error');
             }
-        } catch (e) {
-            log(`Error parsing message: ${e}`, 'error');
-        }
-    };
+        };
 
-    ws.onclose = (event) => {
-        let reason = "Unknown reason";
-        if (event.code === 4001) {
-            reason = "Authentication failed";
-        } else if (event.code === 4002) {
-            reason = "Invalid user ID";
-        } else if (event.code === 1000) {
-            reason = "Normal closure";
-        }
-        log(`Disconnected from WebSocket: ${reason}`, event.code === 1000 ? 'info' : 'error');
-        document.getElementById('connectBtn').disabled = false;
-        document.getElementById('disconnectBtn').disabled = true;
-        document.getElementById('sendBtn').disabled = true;
-    };
+        ws.onclose = (event) => {
+            let reason = "Unknown reason";
+            if (event.code === 4001) {
+                reason = "Authentication failed";
+            } else if (event.code === 4002) {
+                reason = "Invalid user ID";
+            } else if (event.code === 1000) {
+                reason = "Normal closure";
+            }
+            log(`Disconnected from WebSocket: ${reason}`, event.code === 1000 ? 'info' : 'error');
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+            document.getElementById('sendBtn').disabled = true;
+        };
 
-    ws.onerror = (error) => {
-        log(`WebSocket error occurred`, 'error');
-        console.error('WebSocket error:', error);
-    };
-}
+        ws.onerror = (error) => {
+            log(`WebSocket error occurred`, 'error');
+            console.error('WebSocket error:', error);
+        };
+    }
 
     function disconnect() {
         if (ws) {
@@ -210,35 +234,196 @@
         }
     }
 
-    function sendMessage() {
+    async function uploadFile(file, messageType, toUser) {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('to_user', toUser);
+
+        try {
+            const authValue = document.getElementById('authValue').value;
+            const authType = document.getElementById('authType').value;
+
+            const headers = {};
+            if (authType === 'api-key') {
+                headers['api-key'] = authValue;
+            } else {
+                headers['phone'] = authValue;
+            }
+
+            const response = await fetch(`/upload/${messageType}`, {
+                method: 'POST',
+                headers: headers,
+                body: formData
+            });
+
+            if (!response.ok) {
+                throw new Error(`Upload failed: ${response.statusText}`);
+            }
+
+            return await response.json();
+        } catch (error) {
+            log(`File upload error: ${error.message}`, 'error');
+            throw error;
+        }
+    }
+
+    document.getElementById('fileInput').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        const previewArea = document.getElementById('mediaPreview');
+        const messageType = document.getElementById('messageType').value;
+
+        if (!file) {
+            previewArea.innerHTML = '';
+            return;
+        }
+
+        const reader = new FileReader();
+
+        reader.onload = function(e) {
+            let preview = '';
+            if (messageType === 'image') {
+                preview = `<img src="${e.target.result}" class="media-preview">`;
+            } else if (messageType === 'video') {
+                preview = `<video src="${e.target.result}" controls class="media-preview"></video>`;
+            } else if (messageType === 'audio' || messageType === 'voice') {
+                preview = `<audio src="${e.target.result}" controls></audio>`;
+            } else {
+                preview = `<div>File selected: ${file.name}</div>`;
+            }
+            previewArea.innerHTML = preview;
+        };
+
+        if (messageType === 'image' || messageType === 'video' || messageType === 'audio' || messageType === 'voice') {
+            reader.readAsDataURL(file);
+        } else {
+            reader.readAsText(file);
+        }
+    });
+
+    document.getElementById('messageType').addEventListener('change', function() {
+        const fileInput = document.getElementById('fileInput');
+        const messageInput = document.getElementById('messageInput');
+        const previewArea = document.getElementById('mediaPreview');
+
+        if (this.value === 'text') {
+            fileInput.style.display = 'none';
+            messageInput.style.display = 'block';
+            previewArea.innerHTML = '';
+        } else {
+            fileInput.style.display = 'block';
+            messageInput.style.display = 'none';
+            fileInput.value = '';
+            previewArea.innerHTML = '';
+
+            switch(this.value) {
+                case 'image':
+                    fileInput.accept = 'image/*';
+                    break;
+                case 'audio':
+                    fileInput.accept = 'audio/*';
+                    break;
+                case 'video':
+                    fileInput.accept = 'video/*';
+                    break;
+                case 'voice':
+                    fileInput.accept = 'audio/*';
+                    break;
+                default:
+                    fileInput.accept = '';
+            }
+        }
+    });
+
+    async function sendMessage() {
         if (!ws) {
             log('Not connected!', 'error');
             return;
         }
 
         const toUser = document.getElementById('toUser').value;
-        const message = document.getElementById('messageInput').value;
+        const messageType = document.getElementById('messageType').value;
+        const fileInput = document.getElementById('fileInput');
+        const messageInput = document.getElementById('messageInput');
 
-        if (!toUser || !message) {
-            log('Please fill in both recipient and message', 'error');
+        if (!toUser) {
+            log('Please specify recipient', 'error');
             return;
         }
 
-        const messageObj = {
-            to_user: toUser,
-            content: message
-        };
+        try {
+            if (messageType === 'text') {
+                const message = messageInput.value;
+                if (!message) {
+                    log('Please enter a message', 'error');
+                    return;
+                }
 
-        ws.send(JSON.stringify(messageObj));
-        log(`Sent: ${JSON.stringify(messageObj)}`);
-        document.getElementById('messageInput').value = '';
+                const messageObj = {
+                    to_user: toUser,
+                    content: message,
+                    message_type: 'text'
+                };
+
+                ws.send(JSON.stringify(messageObj));
+                log(`Sent text message: ${message}`);
+                messageInput.value = '';
+            } else {
+                const file = fileInput.files[0];
+                if (!file) {
+                    log('Please select a file', 'error');
+                    return;
+                }
+
+                const result = await uploadFile(file, messageType, toUser);
+                log(`File uploaded successfully: ${result.message.file_name}`, 'success');
+                fileInput.value = '';
+                document.getElementById('mediaPreview').innerHTML = '';
+            }
+        } catch (error) {
+            log(`Error sending message: ${error.message}`, 'error');
+        }
     }
 
     function log(message, type = 'info') {
         const messageArea = document.getElementById('messageArea');
         const time = new Date().toLocaleTimeString();
         const className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
-        messageArea.innerHTML += `<div class="${className}">[${time}] ${message}</div>`;
+
+        let messageContent = message;
+        if (typeof message === 'object') {
+            if (message.message_type && message.message_type !== 'text') {
+                const mediaUrl = `/files/${message.message_type}/${message.file_name}`;
+                switch(message.message_type) {
+                    case 'image':
+                        messageContent = `<div class="media-message">
+                            <img src="${mediaUrl}" alt="Image">
+                            <span>${message.content}</span>
+                        </div>`;
+                        break;
+                    case 'video':
+                        messageContent = `<div class="media-message">
+                            <video src="${mediaUrl}" controls></video>
+                            <span>${message.content}</span>
+                        </div>`;
+                        break;
+                    case 'audio':
+                    case 'voice':
+                        messageContent = `<div class="media-message">
+                            <audio src="${mediaUrl}" controls></audio>
+                            <span>${message.content}</span>
+                        </div>`;
+                        break;
+                    default:
+                        messageContent = `<div class="media-message">
+                            <a href="${mediaUrl}" target="_blank">Download ${message.content}</a>
+                        </div>`;
+                }
+            } else {
+                messageContent = JSON.stringify(message);
+            }
+        }
+
+        messageArea.innerHTML += `<div class="${className}">[${time}] ${messageContent}</div>`;
         messageArea.scrollTop = messageArea.scrollHeight;
     }
 </script>
