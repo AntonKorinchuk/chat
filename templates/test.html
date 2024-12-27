@@ -1,431 +1,621 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Chat Test Interface</title>
+    <title>Simple Chat</title>
     <style>
-        .container { max-width: 800px; margin: 20px auto; padding: 20px; }
-        .panel { border: 1px solid #ccc; padding: 15px; margin: 10px 0; }
-        .messages { height: 300px; overflow-y: auto; border: 1px solid #eee; padding: 10px; margin: 10px 0; }
-        .input-group { margin: 10px 0; }
-        label { display: block; margin: 5px 0; }
+        body { margin: 0; font-family: Arial, sans-serif; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+        /* Login/Register styles */
+        .auth-container {
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+
+        /* Chat styles */
+        .chat-container {
+            display: none;
+            height: 100vh;
+            grid-template-columns: 250px 1fr;
+        }
+
+        .chat-list {
+            border-right: 1px solid #ccc;
+            overflow-y: auto;
+            padding: 10px;
+        }
+
+        .chat-item {
+            padding: 10px;
+            margin: 5px 0;
+            cursor: pointer;
+            border-radius: 5px;
+        }
+
+        .chat-item:hover {
+            background: #f0f0f0;
+        }
+
+        .chat-item.active {
+            background: #e0e0e0;
+        }
+
+        .chat-main {
+            display: grid;
+            grid-template-rows: auto 1fr auto;
+            padding: 10px;
+        }
+
+        .chat-messages {
+            overflow-y: auto;
+            padding: 10px;
+            background: #f9f9f9;
+            margin: 10px 0;
+        }
+
+        .message {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 5px;
+            max-width: 70%;
+        }
+
+        .message.sent {
+            background: #dcf8c6;
+            margin-left: auto;
+        }
+
+        .message.received {
+            background: white;
+            border: 1px solid #ddd;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+            padding: 10px;
+        }
+
+        input, button {
+            padding: 8px;
+            margin: 5px 0;
+        }
+
+        input[type="text"], input[type="password"] {
+            width: 100%;
+        }
+
+        button {
+            background: #0084ff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #0073e6;
+        }
+
         .error { color: red; }
         .success { color: green; }
-        .message-content { margin: 5px 0; }
-        .media-preview { max-width: 200px; max-height: 200px; margin: 5px 0; }
-        .file-upload { margin: 10px 0; padding: 10px; border: 1px dashed #ccc; }
-        .media-message { display: flex; align-items: center; margin: 5px 0; }
-        .media-message img, .media-message video, .media-message audio {
-            max-width: 150px;
-            max-height: 150px;
-            margin-right: 10px;
-        }
     </style>
 </head>
 <body>
-<div class="container">
-    <!-- Registration Panel -->
-    <div class="panel">
-        <h3>1. Registration</h3>
-
-        <div class="input-group">
-            <h4>Register Staff (Admin/Mechanic)</h4>
-            <label>Name: <input type="text" id="staffName"></label>
-            <label>API Key: <input type="text" id="apiKey"></label>
-            <label>Type:
-                <select id="userType">
-                    <option value="admin">Admin</option>
-                    <option value="mechanic">Mechanic</option>
-                </select>
-            </label>
-            <button onclick="registerStaff()">Register Staff</button>
+    <!-- Auth Container -->
+    <div class="auth-container" id="authContainer">
+        <h2>Вхід/Реєстрація</h2>
+        <div id="loginForm">
+            <h3>Вхід</h3>
+            <input type="text" id="loginApiKey" placeholder="API ключ">
+            <input type="text" id="loginPhone" placeholder="Або номер телефону">
+            <button onclick="login()">Увійти</button>
         </div>
 
-        <div class="input-group">
-            <h4>Register Customer</h4>
-            <label>Name: <input type="text" id="customerName"></label>
-            <label>Phone: <input type="text" id="phone"></label>
-            <button onclick="registerCustomer()">Register Customer</button>
+        <hr>
+
+        <div id="registerForm">
+            <h3>Реєстрація</h3>
+            <select id="regType">
+                <option value="staff">Співробітник</option>
+                <option value="customer">Клієнт</option>
+            </select>
+            <input type="text" id="regName" placeholder="Ім'я">
+            <div id="staffFields">
+                <select id="staffType">
+                    <option value="admin">Адмін</option>
+                    <option value="mechanic">Механік</option>
+                </select>
+            </div>
+            <div id="customerFields" style="display: none;">
+                <input type="text" id="regPhone" placeholder="Номер телефону">
+            </div>
+            <button onclick="register()">Зареєструватися</button>
         </div>
     </div>
 
-    <!-- Connection Panel -->
-    <div class="panel">
-        <h3>2. WebSocket Connection</h3>
-        <div class="input-group">
-            <label>User ID: <input type="text" id="userId"></label>
-            <label>Authentication: <input type="text" id="authValue" placeholder="API Key or Phone"></label>
-            <label>Auth Type:
-                <select id="authType">
-                    <option value="api-key">API Key</option>
-                    <option value="phone">Phone</option>
-                </select>
-            </label>
-            <button onclick="connect()" id="connectBtn">Connect</button>
-            <button onclick="disconnect()" id="disconnectBtn" disabled>Disconnect</button>
+    <!-- Chat Container -->
+    <div class="chat-container" id="chatContainer">
+        <div class="chat-list" id="chatList">
+            <!-- Chat list will be populated here -->
         </div>
-    </div>
 
-    <!-- Messaging Panel with File Upload -->
-    <div class="panel">
-        <h3>3. Messaging</h3>
-        <div class="messages" id="messageArea"></div>
-        <div class="input-group">
-            <label>To User ID: <input type="text" id="toUser"></label>
-            <label>Message: <input type="text" id="messageInput"></label>
-
-            <!-- File Upload Section -->
-            <div class="file-upload">
-                <label>Message Type:
-                    <select id="messageType">
-                        <option value="text">Text</option>
-                        <option value="image">Image</option>
-                        <option value="audio">Audio</option>
-                        <option value="video">Video</option>
-                        <option value="voice">Voice</option>
-                        <option value="file">File</option>
-                    </select>
-                </label>
-                <label>File: <input type="file" id="fileInput"></label>
-                <div id="mediaPreview"></div>
+        <div class="chat-main">
+            <div class="chat-header">
+                <h3 id="currentChatTitle">Виберіть чат</h3>
+                <button onclick="logout()" style="float: right;">Вийти</button>
             </div>
 
-            <button onclick="sendMessage()" id="sendBtn" disabled>Send Message</button>
+            <div class="chat-messages" id="messagesContainer">
+                <!-- Messages will be populated here -->
+            </div>
+
+            <div class="input-group">
+                <input type="text" id="messageInput" placeholder="Введіть повідомлення...">
+                <input type="file" id="fileInput">
+                <button onclick="sendMessage()">Надіслати</button>
+            </div>
         </div>
     </div>
-</div>
 
-<script>
-    let ws = null;
+    <script>
+        let currentUser = null;
+        let ws = null;
+        let currentChat = null;
 
-    async function registerStaff() {
-        const name = document.getElementById('staffName').value;
-        const apiKey = document.getElementById('apiKey').value;
-        const userType = document.getElementById('userType').value;
+        // Toggle registration fields based on user type
+        document.getElementById('regType').addEventListener('change', function() {
+            document.getElementById('staffFields').style.display =
+                this.value === 'staff' ? 'block' : 'none';
+            document.getElementById('customerFields').style.display =
+                this.value === 'customer' ? 'block' : 'none';
+        });
 
-        if (!name || !apiKey) {
-            log('Please fill in all fields', 'error');
-            return;
-        }
+        async function login() {
+            const apiKey = document.getElementById('loginApiKey').value;
+            const phone = document.getElementById('loginPhone').value;
 
-        try {
-            const response = await fetch('/register/staff', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': apiKey
-                },
-                body: JSON.stringify({
-                    user_type: userType,
-                    name: name
-                })
-            });
-
-            const data = await response.json();
-
-            if (response.ok) {
-                log(`Staff registration successful: ${data.message}`, 'success');
-                log(`Your user ID is: ${data.user_id}`, 'success');
-            } else {
-                log(`Registration error: ${data.detail}`, 'error');
+            if (!apiKey && !phone) {
+                alert('Введіть API ключ або номер телефону');
+                return;
             }
-        } catch (error) {
-            log(`Error registering staff: ${error}`, 'error');
-        }
-    }
 
-    async function registerCustomer() {
-        const name = document.getElementById('customerName').value;
-        const phone = document.getElementById('phone').value;
-
-        if (!name || !phone) {
-            log('Please fill in all fields', 'error');
-            return;
-        }
-
-        try {
-            const response = await fetch('/register/customer', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    name: name,
-                    phone: phone
-                })
-            });
-
-            const data = await response.json();
-
-            if (response.ok) {
-                log(`Customer registration successful: ${data.message}`, 'success');
-                log(`Your user ID is: ${data.user_id}`, 'success');
-            } else {
-                log(`Registration error: ${data.detail}`, 'error');
-            }
-        } catch (error) {
-            log(`Error registering customer: ${error}`, 'error');
-        }
-    }
-
-    function connect() {
-        const userId = document.getElementById('userId').value;
-        const authValue = document.getElementById('authValue').value;
-        const authType = document.getElementById('authType').value;
-
-        if (!userId || !authValue) {
-            log('Please fill in all connection fields', 'error');
-            return;
-        }
-
-        const wsUrl = new URL(`ws://${window.location.host}/ws/${userId}`);
-        if (authType === 'api-key') {
-            wsUrl.searchParams.append('api_key', authValue);
-        } else {
-            wsUrl.searchParams.append('phone', authValue);
-        }
-
-        ws = new WebSocket(wsUrl.href);
-
-        ws.onopen = () => {
-            log('Connected to WebSocket', 'success');
-            document.getElementById('connectBtn').disabled = true;
-            document.getElementById('disconnectBtn').disabled = false;
-            document.getElementById('sendBtn').disabled = false;
-        };
-
-        ws.onmessage = (event) => {
             try {
-                const message = JSON.parse(event.data);
-                if (message.error) {
-                    log(`Error: ${message.message}`, 'error');
+                const params = new URLSearchParams();
+                if (apiKey) params.append('api_key', apiKey);
+                if (phone) params.append('phone', phone);
+
+                const response = await fetch(`/login?${params.toString()}`, {
+                    method: 'POST'
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    currentUser = {
+                        user_id: data.user_id,
+                        user_type: data.user_type,
+                        api_key: apiKey,
+                        phone: phone,
+                        access_token: data.access_token
+                    };
+                    sessionStorage.setItem('user', JSON.stringify(currentUser));
+
+                    connectWebSocket();
+                    showChat();
+                    if (data.user_type === 'admin') {
+                        loadStaffChats();
+                    }
                 } else {
-                    log(message);
+                    alert('Помилка входу: ' + (data.detail || 'Невідома помилка'));
                 }
-            } catch (e) {
-                log(`Error parsing message: ${e}`, 'error');
+            } catch (error) {
+                console.error('Login error:', error);
+                alert('Помилка: ' + error.message);
             }
-        };
-
-        ws.onclose = (event) => {
-            let reason = "Unknown reason";
-            if (event.code === 4001) {
-                reason = "Authentication failed";
-            } else if (event.code === 4002) {
-                reason = "Invalid user ID";
-            } else if (event.code === 1000) {
-                reason = "Normal closure";
-            }
-            log(`Disconnected from WebSocket: ${reason}`, event.code === 1000 ? 'info' : 'error');
-            document.getElementById('connectBtn').disabled = false;
-            document.getElementById('disconnectBtn').disabled = true;
-            document.getElementById('sendBtn').disabled = true;
-        };
-
-        ws.onerror = (error) => {
-            log(`WebSocket error occurred`, 'error');
-            console.error('WebSocket error:', error);
-        };
-    }
-
-    function disconnect() {
-        if (ws) {
-            ws.close();
-            ws = null;
         }
-    }
 
-    async function uploadFile(file, messageType, toUser) {
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('to_user', toUser);
+        async function register() {
+            const type = document.getElementById('regType').value;
+            const name = document.getElementById('regName').value;
 
-        try {
-            const authValue = document.getElementById('authValue').value;
-            const authType = document.getElementById('authType').value;
+            if (type === 'staff') {
+                const userType = document.getElementById('staffType').value;
+                try {
+                    const response = await fetch('/register/staff', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            user_type: userType,
+                            name: name
+                        })
+                    });
 
-            const headers = {};
-            if (authType === 'api-key') {
-                headers['api-key'] = authValue;
+                    const data = await response.json();
+                    if (response.ok) {
+                        alert(`Успішна реєстрація! Ваш API ключ: ${data.api_key}`);
+                    } else {
+                        alert('Помилка реєстрації: ' + data.detail);
+                    }
+                } catch (error) {
+                    alert('Помилка: ' + error);
+                }
             } else {
-                headers['phone'] = authValue;
-            }
+                const phone = document.getElementById('regPhone').value;
+                try {
+                    const response = await fetch('/register/customer', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            name: name,
+                            phone: phone
+                        })
+                    });
 
-            const response = await fetch(`/upload/${messageType}`, {
-                method: 'POST',
-                headers: headers,
-                body: formData
-            });
-
-            if (!response.ok) {
-                throw new Error(`Upload failed: ${response.statusText}`);
-            }
-
-            return await response.json();
-        } catch (error) {
-            log(`File upload error: ${error.message}`, 'error');
-            throw error;
-        }
-    }
-
-    document.getElementById('fileInput').addEventListener('change', function(e) {
-        const file = e.target.files[0];
-        const previewArea = document.getElementById('mediaPreview');
-        const messageType = document.getElementById('messageType').value;
-
-        if (!file) {
-            previewArea.innerHTML = '';
-            return;
-        }
-
-        const reader = new FileReader();
-
-        reader.onload = function(e) {
-            let preview = '';
-            if (messageType === 'image') {
-                preview = `<img src="${e.target.result}" class="media-preview">`;
-            } else if (messageType === 'video') {
-                preview = `<video src="${e.target.result}" controls class="media-preview"></video>`;
-            } else if (messageType === 'audio' || messageType === 'voice') {
-                preview = `<audio src="${e.target.result}" controls></audio>`;
-            } else {
-                preview = `<div>File selected: ${file.name}</div>`;
-            }
-            previewArea.innerHTML = preview;
-        };
-
-        if (messageType === 'image' || messageType === 'video' || messageType === 'audio' || messageType === 'voice') {
-            reader.readAsDataURL(file);
-        } else {
-            reader.readAsText(file);
-        }
-    });
-
-    document.getElementById('messageType').addEventListener('change', function() {
-        const fileInput = document.getElementById('fileInput');
-        const messageInput = document.getElementById('messageInput');
-        const previewArea = document.getElementById('mediaPreview');
-
-        if (this.value === 'text') {
-            fileInput.style.display = 'none';
-            messageInput.style.display = 'block';
-            previewArea.innerHTML = '';
-        } else {
-            fileInput.style.display = 'block';
-            messageInput.style.display = 'none';
-            fileInput.value = '';
-            previewArea.innerHTML = '';
-
-            switch(this.value) {
-                case 'image':
-                    fileInput.accept = 'image/*';
-                    break;
-                case 'audio':
-                    fileInput.accept = 'audio/*';
-                    break;
-                case 'video':
-                    fileInput.accept = 'video/*';
-                    break;
-                case 'voice':
-                    fileInput.accept = 'audio/*';
-                    break;
-                default:
-                    fileInput.accept = '';
+                    const data = await response.json();
+                    if (response.ok) {
+                        alert('Успішна реєстрація! Використовуйте свій номер телефону для входу.');
+                    } else {
+                        alert('Помилка реєстрації: ' + data.detail);
+                    }
+                } catch (error) {
+                    alert('Помилка: ' + error);
+                }
             }
         }
-    });
 
-    async function sendMessage() {
-        if (!ws) {
-            log('Not connected!', 'error');
-            return;
-        }
+        function connectWebSocket() {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = new URL(`${wsProtocol}//${window.location.host}/ws/${currentUser.user_id}`);
 
-        const toUser = document.getElementById('toUser').value;
-        const messageType = document.getElementById('messageType').value;
-        const fileInput = document.getElementById('fileInput');
-        const messageInput = document.getElementById('messageInput');
+            if (currentUser.access_token) {
+                wsUrl.searchParams.append('token', currentUser.access_token);
+            } else if (currentUser.api_key) {
+                wsUrl.searchParams.append('api_key', currentUser.api_key);
+            } else if (currentUser.phone) {
+                wsUrl.searchParams.append('phone', currentUser.phone);
+            }
 
-        if (!toUser) {
-            log('Please specify recipient', 'error');
-            return;
-        }
+            ws = new WebSocket(wsUrl.href);
+            let reconnectAttempts = 0;
+            const maxReconnectAttempts = 5;
+            let reconnectTimeout;
 
-        try {
-            if (messageType === 'text') {
-                const message = messageInput.value;
-                if (!message) {
-                    log('Please enter a message', 'error');
+            ws.onmessage = async (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+
+                    // If we receive a message and don't have the chat loaded yet
+                    if (message.chat_id && (!currentChat || currentChat.id !== message.chat_id)) {
+                        await loadChat(message.chat_id);
+                    }
+
+                    displayMessage(message);
+
+                    // Reload chat list for staff members
+                    if (currentUser.user_type === 'admin' || currentUser.user_type === 'mechanic') {
+                        await loadStaffChats();
+                    }
+                } catch (error) {
+                    console.error('Error processing message:', error);
+                }
+            };
+
+            ws.onopen = () => {
+                console.log('WebSocket connection established for user:', currentUser.user_id);
+                reconnectAttempts = 0; // Reset reconnection attempts on successful connection
+                if (reconnectTimeout) {
+                    clearTimeout(reconnectTimeout);
+                    reconnectTimeout = null;
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onclose = (event) => {
+                console.log('WebSocket connection closed:',
+                    'Code:', event.code,
+                    'Reason:', event.reason,
+                    'Clean:', event.wasClean
+                );
+
+                if (event.code === 4001) {
+                    alert('Session expired. Please login again.');
+                    logout();
                     return;
                 }
 
-                const messageObj = {
-                    to_user: toUser,
-                    content: message,
-                    message_type: 'text'
-                };
+                // Attempt to reconnect unless explicitly logged out
+                if (currentUser && reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000); // Exponential backoff
+                    console.log(`Attempting to reconnect in ${delay}ms (attempt ${reconnectAttempts})`);
 
-                ws.send(JSON.stringify(messageObj));
-                log(`Sent text message: ${message}`);
-                messageInput.value = '';
-            } else {
-                const file = fileInput.files[0];
-                if (!file) {
-                    log('Please select a file', 'error');
-                    return;
+                    reconnectTimeout = setTimeout(() => {
+                        if (currentUser) { // Double check user is still logged in
+                            connectWebSocket();
+                        }
+                    }, delay);
+                } else if (reconnectAttempts >= maxReconnectAttempts) {
+                    alert('Unable to maintain connection. Please refresh the page.');
                 }
+            };
 
-                const result = await uploadFile(file, messageType, toUser);
-                log(`File uploaded successfully: ${result.message.file_name}`, 'success');
-                fileInput.value = '';
-                document.getElementById('mediaPreview').innerHTML = '';
-            }
-        } catch (error) {
-            log(`Error sending message: ${error.message}`, 'error');
+            return ws;
         }
-    }
 
-    function log(message, type = 'info') {
-        const messageArea = document.getElementById('messageArea');
-        const time = new Date().toLocaleTimeString();
-        const className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
+        function startChatRefresh() {
+            if (currentUser && (currentUser.user_type === 'admin' || currentUser.user_type === 'mechanic')) {
+                setInterval(loadStaffChats, 5000); // Refresh every 5 seconds
+            }
+        }
 
-        let messageContent = message;
-        if (typeof message === 'object') {
-            if (message.message_type && message.message_type !== 'text') {
-                const mediaUrl = `/files/${message.message_type}/${message.file_name}`;
+        function showChat() {
+            document.getElementById('authContainer').style.display = 'none';
+            document.getElementById('chatContainer').style.display = 'grid';
+
+            if (currentUser.user_type === 'admin' || currentUser.user_type === 'mechanic') {
+                loadStaffChats();
+                startChatRefresh();
+            }
+        }
+
+        async function loadStaffChats() {
+            if (!currentUser || !currentUser.api_key) return;
+
+            try {
+                const response = await fetch('/chats', {
+                    headers: {
+                        'api-key': currentUser.api_key
+                    }
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    const chatList = document.getElementById('chatList');
+                    chatList.innerHTML = '';
+
+                    data.chats.forEach(chat => {
+                        const div = document.createElement('div');
+                        div.className = 'chat-item' + (currentChat && currentChat.id === chat.id ? ' active' : '');
+                        div.textContent = chat.title || `Чат з ${chat.customer_id}`;
+                        if (chat.unread_count > 0) {
+                            div.textContent += ` (${chat.unread_count})`;
+                        }
+                        div.onclick = () => loadChat(chat.id);
+                        chatList.appendChild(div);
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading chats:', error);
+            }
+        }
+
+        async function loadChat(chatId) {
+            try {
+                const response = await fetch(`/chats/${chatId}`, {
+                    headers: {
+                        'api-key': currentUser.api_key
+                    }
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    currentChat = data.chat;
+                    document.getElementById('currentChatTitle').textContent =
+                        currentChat.title || `Чат з ${currentChat.customer_id}`;
+
+                    const messagesContainer = document.getElementById('messagesContainer');
+                    messagesContainer.innerHTML = '';
+
+                    data.messages.forEach(displayMessage);
+
+                    const chatItems = document.querySelectorAll('.chat-item');
+                    chatItems.forEach(item => {
+                        item.classList.remove('active');
+                        if (item.textContent === (currentChat.title || `Чат з ${currentChat.customer_id}`)) {
+                            item.classList.add('active');
+                        }
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading chat:', error);
+            }
+        }
+
+        function displayMessage(message) {
+            if (message.chat_id && !currentChat) {
+                if (currentUser.user_type === 'admin') {
+                    const chatList = document.getElementById('chatList');
+                    const existingChat = Array.from(chatList.children)
+                        .find(child => child.textContent === `Чат з ${message.from_user}`);
+
+                    if (!existingChat) {
+                        const div = document.createElement('div');
+                        div.className = 'chat-item';
+                        div.textContent = `Чат з ${message.from_user}`;
+                        div.onclick = () => loadChat(message.chat_id);
+                        chatList.appendChild(div);
+                    }
+                }
+            }
+
+            const messagesContainer = document.getElementById('messagesContainer');
+            const div = document.createElement('div');
+            div.className = `message ${message.from_user === currentUser.user_id ? 'sent' : 'received'}`;
+
+            const content = message.source === 'telegram' ?
+                `[Telegram] ${message.content}` : message.content;
+
+            if (message.message_type === 'text') {
+                div.textContent = content;
+            } else {
+                const mediaUrl = message.local_file_url || `/files/${message.message_type}/${message.file_name}`;
                 switch(message.message_type) {
                     case 'image':
-                        messageContent = `<div class="media-message">
-                            <img src="${mediaUrl}" alt="Image">
-                            <span>${message.content}</span>
-                        </div>`;
-                        break;
-                    case 'video':
-                        messageContent = `<div class="media-message">
-                            <video src="${mediaUrl}" controls></video>
-                            <span>${message.content}</span>
-                        </div>`;
+                        div.innerHTML = `<img src="${mediaUrl}" style="max-width: 200px"><br>${content}`;
                         break;
                     case 'audio':
                     case 'voice':
-                        messageContent = `<div class="media-message">
-                            <audio src="${mediaUrl}" controls></audio>
-                            <span>${message.content}</span>
-                        </div>`;
+                        div.innerHTML = `<audio controls src="${mediaUrl}"></audio><br>${content}`;
+                        break;
+                    case 'video':
+                        div.innerHTML = `<video controls src="${mediaUrl}" style="max-width: 200px"></video><br>${content}`;
                         break;
                     default:
-                        messageContent = `<div class="media-message">
-                            <a href="${mediaUrl}" target="_blank">Download ${message.content}</a>
-                        </div>`;
+                        div.innerHTML = `<a href="${mediaUrl}" target="_blank">Завантажити файл</a><br>${content}`;
                 }
-            } else {
-                messageContent = JSON.stringify(message);
+            }
+
+            messagesContainer.appendChild(div);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        async function sendMessage() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                console.error('WebSocket not connected. State:', ws ? ws.readyState : 'null');
+                alert('Немає з\'єднання з сервером');
+                return;
+            }
+
+            const input = document.getElementById('messageInput');
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+
+            if (!input.value && !file) {
+                alert('Введіть повідомлення або виберіть файл');
+                return;
+            }
+
+            try {
+                let to_user;
+                if (currentUser.user_type === 'admin' || currentUser.user_type === 'mechanic') {
+                    to_user = currentChat ? currentChat.customer_id : null;
+                } else {
+                    to_user = 'admin';
+                }
+
+                const timestamp = new Date().toISOString();
+
+                if (file) {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    formData.append('to_user', to_user);
+
+                    let messageType = 'file';
+                    if (file.type.startsWith('image/')) messageType = 'image';
+                    else if (file.type.startsWith('audio/')) messageType = 'audio';
+                    else if (file.type.startsWith('video/')) messageType = 'video';
+
+                    const localMessage = {
+                        from_user: currentUser.user_id,
+                        to_user: to_user,
+                        content: input.value || file.name,
+                        timestamp: timestamp,
+                        message_type: messageType,
+                        chat_id: currentChat ? currentChat.id : null,
+                        file_name: file.name,
+                        local_file_url: URL.createObjectURL(file)
+                    };
+                    displayMessage(localMessage);
+
+                    const headers = {};
+                    if (currentUser.api_key) headers['api-key'] = currentUser.api_key;
+                    if (currentUser.phone) headers['phone'] = currentUser.phone;
+
+                    const response = await fetch(`/upload/${messageType}`, {
+                        method: 'POST',
+                        headers: headers,
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(await response.text());
+                    }
+
+                    fileInput.value = '';
+                }
+
+                if (input.value) {
+                    const localMessage = {
+                        from_user: currentUser.user_id,
+                        to_user: to_user,
+                        content: input.value,
+                        timestamp: timestamp,
+                        message_type: 'text',
+                        chat_id: currentChat ? currentChat.id : null
+                    };
+                    displayMessage(localMessage);
+
+                    const message = {
+                        to_user: to_user,
+                        content: input.value,
+                        message_type: 'text',
+                        chat_id: currentChat ? currentChat.id : null
+                    };
+
+                    ws.send(JSON.stringify(message));
+                    input.value = '';
+                }
+
+            } catch (error) {
+                console.error('Error sending message:', error);
+                alert('Помилка відправки: ' + error.message);
+
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'error-message';
+                errorDiv.textContent = 'Помилка відправки повідомлення';
+                document.getElementById('messagesContainer').appendChild(errorDiv);
             }
         }
 
-        messageArea.innerHTML += `<div class="${className}">[${time}] ${messageContent}</div>`;
-        messageArea.scrollTop = messageArea.scrollHeight;
-    }
-</script>
+        function logout() {
+            currentUser = null;
+            sessionStorage.removeItem('user');
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            document.getElementById('authContainer').style.display = 'block';
+            document.getElementById('chatContainer').style.display = 'none';
+        }
+
+        function checkSession() {
+            const savedUser = sessionStorage.getItem('user');
+            if (savedUser) {
+                try {
+                    currentUser = JSON.parse(savedUser);
+                    connectWebSocket();
+                    showChat();
+                    if (currentUser.user_type === 'admin' || currentUser.user_type === 'mechanic') {
+                        loadStaffChats();
+                    }
+                } catch (error) {
+                    console.error('Error restoring session:', error);
+                    sessionStorage.removeItem('user');
+                    logout();
+                }
+            }
+        }
+
+        window.addEventListener('beforeunload', () => {
+            if (ws) {
+                ws.close();
+            }
+        });
+
+        document.addEventListener('DOMContentLoaded', () => {
+            checkSession();
+        });
+    </script>
 </body>
 </html>

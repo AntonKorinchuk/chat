@@ -1,10 +1,11 @@
 import os
+import traceback
 from uuid import uuid4
 
 import aiofiles
 import requests
 from fastapi import WebSocket, HTTPException, UploadFile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from enum import Enum
 from pydantic import BaseModel
 from datetime import datetime
@@ -70,6 +71,7 @@ class ConnectionManager:
         self.api_keys: Dict[str, User] = {}
         self.phone_numbers: Dict[str, User] = {}
         self.telegram_ids: Dict[int, User] = {}
+        self.chat_manager = ChatManager()
 
     async def register_user(self, user: User) -> None:
         self.users[user.id] = user
@@ -89,28 +91,35 @@ class ConnectionManager:
     def get_user_by_telegram_id(self, telegram_id: int) -> Optional[User]:
         return self.telegram_ids.get(telegram_id)
 
-    def get_active_admins(self) -> List[str]:
+    def get_active_staff(self) -> List[str]:
+        """Get list of active admin and mechanic IDs"""
         return [
             user_id for user_id, user in self.users.items()
-            if user.type == UserType.ADMIN and user_id in self.connections
+            if (user.type in [UserType.ADMIN, UserType.MECHANIC]) and user_id in self.connections
         ]
 
     def get_user_telegram_id(self, user_id: str) -> Optional[int]:
         user = self.users.get(user_id)
         return user.telegram_id if user else None
 
-    async def send_message_to_active_admin(self, message: Message) -> bool:
-        active_admins = self.get_active_admins()
-        if not active_admins:
+    async def send_message_to_active_staff(self, message: Message) -> bool:
+        """Send message to first available staff member (admin or mechanic)"""
+        active_staff = self.get_active_staff()
+        if not active_staff:
             return False
 
-        admin_id = active_admins[0]
-        message.to_user = admin_id
+        staff_id = active_staff[0]
+        message.to_user = staff_id
         await self.send_message(message)
         return True
 
     async def connect(self, websocket: WebSocket, user_id: str) -> None:
         await websocket.accept()
+
+
+        if user_id in self.connections:
+            await self.connections[user_id].close(code=4000, reason="New connection established")
+
         self.connections[user_id] = websocket
 
     async def disconnect(self, user_id: str) -> None:
@@ -200,29 +209,70 @@ class ConnectionManager:
             }
             return requests.post(url, json=data).json()
 
-    async def send_message(self, message: Message) -> None:
+    async def get_or_create_chat(self, from_user: str, to_user: str) -> str:
+        """Get existing chat or create new one"""
+        # Перевіряємо існуючі чати
+        for chat_id, chat in self.chat_manager.chats.items():
+            if (chat.admin_id == from_user and chat.customer_id == to_user) or \
+                    (chat.admin_id == to_user and chat.customer_id == from_user):
+                return chat_id
+
+        # Визначаємо хто адмін, а хто клієнт
+        admin_id = from_user if from_user.startswith('admin_') else to_user
+        customer_id = to_user if from_user.startswith('admin_') else from_user
+
+        # Створюємо новий чат
+        chat = await self.chat_manager.create_chat(admin_id, customer_id)
+        return chat.id
+
+    async def send_message(self, message: Message, chat_id: Optional[str] = None) -> None:
         try:
-            self.store_message(message)
+            print(f"Sending message: {message.to_json()}")
+            print(f"Current connections: {list(self.connections.keys())}")
 
-            if message.to_user.startswith("telegram_"):
-                telegram_id = int(message.to_user.split("_")[1])
-                print(f"Sending message to Telegram {telegram_id}")
-                print(f"Message type: {message.message_type}")
-                print(f"File path: {message.file_path}")
-                print(f"Content: {message.content}")
+            if not chat_id:
+                if message.from_user.startswith('customer_'):
+                    active_staff = self.get_active_staff()
+                    print(f"Active staff members: {active_staff}")
+                    if not active_staff:
+                        raise ValueError("No active staff members available")
+                    message.to_user = active_staff[0]
+                    print(f"Selected staff member: {message.to_user}")
 
+                chat_id = await self.get_or_create_chat(message.from_user, message.to_user)
+                print(f"Created/Retrieved chat_id: {chat_id}")
+
+            await self.chat_manager.add_message_to_chat(chat_id, message)
+            print(f"Message added to chat: {chat_id}")
+
+            # Перевіряємо, чи отримувач є Telegram користувачем
+            if message.to_user.startswith('telegram_'):
+                telegram_id = int(message.to_user.split('_')[1])
+                print(f"Sending to Telegram user: {telegram_id}")
+
+                # Відправляємо повідомлення через Telegram API
                 await self.send_telegram_message(
                     telegram_id,
                     message.content,
                     message.file_path,
                     message.message_type
                 )
-
-            if message.to_user in self.connections:
-                await self.connections[message.to_user].send_json(message.to_json())
+            elif message.to_user in self.connections:
+                print(f"Sending to WebSocket connection: {message.to_user}")
+                await self.connections[message.to_user].send_json({
+                    **message.to_json(),
+                    "chat_id": chat_id
+                })
+            else:
+                print(f"No WebSocket connection for user: {message.to_user}")
+                # Якщо немає з'єднання, зберігаємо повідомлення для подальшої доставки
+                if message.to_user not in self.message_history:
+                    self.message_history[message.to_user] = []
+                self.message_history[message.to_user].append(message)
 
         except Exception as e:
             print(f"Error in send_message: {str(e)}")
+            print(f"Error traceback: {traceback.format_exc()}")
             raise
 
 
@@ -282,3 +332,96 @@ class FileManager:
             await out_file.write(content)
 
         return filepath, relative_path
+
+
+class ChatStatus(Enum):
+    ACTIVE = "active"
+    CLOSED = "closed"
+    PENDING = "pending"
+
+
+class Chat(BaseModel):
+    id: str
+    admin_id: str
+    customer_id: str
+    status: ChatStatus
+    created_at: datetime
+    updated_at: datetime
+    title: Optional[str] = None
+    last_message: Optional[str] = None
+    unread_count: int = 0
+
+
+class ChatManager:
+    def __init__(self):
+        self.chats: Dict[str, Chat] = {}
+        self.admin_chats: Dict[str, Set[str]] = {}  # admin_id -> set of chat_ids
+        self.customer_chats: Dict[str, Set[str]] = {}  # customer_id -> set of chat_ids
+        self.chat_messages: Dict[str, List[Message]] = {}  # chat_id -> list of messages
+
+    async def create_chat(self, staff_id: str, customer_id: str, title: Optional[str] = None) -> Chat:
+        chat_id = f"chat_{len(self.chats) + 1}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+        # Determine if staff is admin or mechanic
+        is_admin = staff_id.startswith('admin_')
+        staff_type = "admin" if is_admin else "mechanic"
+
+        chat = Chat(
+            id=chat_id,
+            admin_id=staff_id,  # We'll keep the field name as admin_id but it can store mechanic_id too
+            customer_id=customer_id,
+            status=ChatStatus.ACTIVE,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            title=title or f"Chat with {customer_id}",
+            staff_type=staff_type  # Add new field to track staff type
+        )
+
+        self.chats[chat_id] = chat
+
+        # Update relationships
+        if staff_id not in self.admin_chats:
+            self.admin_chats[staff_id] = set()
+        self.admin_chats[staff_id].add(chat_id)
+
+        if customer_id not in self.customer_chats:
+            self.customer_chats[customer_id] = set()
+        self.customer_chats[customer_id].add(chat_id)
+
+        self.chat_messages[chat_id] = []
+
+        return chat
+
+    def get_chat(self, chat_id: str) -> Optional[Chat]:
+        return self.chats.get(chat_id)
+
+    def get_admin_chats(self, admin_id: str) -> List[Chat]:
+        chat_ids = self.admin_chats.get(admin_id, set())
+        return [self.chats[chat_id] for chat_id in chat_ids]
+
+    def get_customer_chats(self, customer_id: str) -> List[Chat]:
+        chat_ids = self.customer_chats.get(customer_id, set())
+        return [self.chats[chat_id] for chat_id in chat_ids]
+
+    async def add_message_to_chat(self, chat_id: str, message: Message) -> None:
+        if chat_id not in self.chat_messages:
+            raise ValueError(f"Chat {chat_id} not found")
+
+        self.chat_messages[chat_id].append(message)
+
+        # Оновлюємо інформацію про чат
+        chat = self.chats[chat_id]
+        chat.updated_at = datetime.now()
+        chat.last_message = message.content
+
+        # Оновлюємо лічильник непрочитаних повідомлень
+        if message.from_user == chat.customer_id:
+            chat.unread_count += 1
+
+    def get_chat_messages(self, chat_id: str) -> List[Message]:
+        return self.chat_messages.get(chat_id, [])
+
+    async def mark_chat_as_read(self, chat_id: str, user_id: str) -> None:
+        chat = self.chats.get(chat_id)
+        if chat and chat.admin_id == user_id:
+            chat.unread_count = 0

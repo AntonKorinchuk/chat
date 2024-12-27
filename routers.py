@@ -8,7 +8,9 @@ from typing import Optional, Union
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from jose import JWTError, jwt
 
+from auth import create_access_token, SECRET_KEY, ALGORITHM
 from config import UPLOAD_DIR, TELEGRAM_API_URL, TELEGRAM_TOKEN
 from managers import ConnectionManager, Message, User, UserType, MessageType, FileManager
 
@@ -76,58 +78,130 @@ async def download_telegram_file(file_id: str) -> tuple[bytes, str, str]:
     return response.content, file_path, response.headers.get('content-type', 'application/octet-stream')
 
 
+@router.post("/login")
+async def login(api_key: Optional[str] = None, phone: Optional[str] = None):
+    user = None
+    if api_key:
+        user = manager.get_user_by_api_key(api_key)
+    elif phone:
+        user = manager.get_user_by_phone(phone)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Create access token
+    token_data = {
+        "sub": user.id,
+        "type": user.type.value,
+        "api_key": user.api_key,
+        "phone": user.phone
+    }
+
+    access_token = create_access_token(token_data)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "user_type": user.type.value
+    }
+
+
 @router.websocket("/ws/{user_id}")
 async def websocket_endpoint(
-    websocket: WebSocket,
-    user_id: str,
-    api_key: Optional[str] = None,
-    phone: Optional[str] = None
+        websocket: WebSocket,
+        user_id: str,
+        api_key: Optional[str] = None,
+        phone: Optional[str] = None
 ):
-    user = await get_token(websocket, api_key, phone)
-    if not user:
-        await websocket.close(code=4001, reason="Authentication failed")
-        return
-
-    if user.id != user_id:
-        await websocket.close(code=4002, reason="Invalid user ID")
-        return
-
-    await manager.connect(websocket, user_id)
-
     try:
-        while True:
-            data = await websocket.receive_json()
+        # Перевірка токена з query parameters
+        token = websocket.query_params.get("token")
+        if token:
+            try:
+                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                if payload["sub"] != user_id:
+                    await websocket.close(code=4002, reason="Invalid user ID")
+                    return
+            except JWTError:
+                await websocket.close(code=4001, reason="Authentication failed")
+                return
+        else:
+            # Альтернативна аутентифікація через API-ключ або телефон
+            user = await get_token(websocket, api_key, phone)
+            if not user or user.id != user_id:
+                await websocket.close(code=4001, reason="Authentication failed")
+                return
 
-            to_user_id = data.get("to_user")
-            content = data.get("content")
-            message_type = data.get("message_type", "text")
-            file_data = data.get("file_data")  # For media messages
+        await manager.connect(websocket, user_id)
 
-            if not all([to_user_id, content]):
-                await websocket.send_json({
-                    "error": True,
-                    "message": "Missing required fields"
-                })
-                continue
+        try:
+            while True:
+                try:
+                    data = await websocket.receive_json()
 
-            message = Message(
-                from_user=user_id,
-                to_user=to_user_id,
-                content=content,
-                timestamp=datetime.now(),
-                message_type=MessageType[message_type.upper()],
-                file_path=file_data.get("file_path") if file_data else None,
-                file_name=file_data.get("file_name") if file_data else None,
-                mime_type=file_data.get("mime_type") if file_data else None
-            )
+                    if not data:
+                        continue
 
-            await manager.send_message(message)
+                    to_user_id = data.get("to_user")
+                    content = data.get("content")
+                    message_type = data.get("message_type", "text")
+                    file_data = data.get("file_data")
+                    chat_id = data.get("chat_id")
+
+                    if not content:
+                        await websocket.send_json({
+                            "error": True,
+                            "message": "Missing required fields"
+                        })
+                        continue
+
+                    # Якщо клієнт відправляє повідомлення без вказання to_user_id
+                    if not to_user_id and user_id.startswith('customer_'):
+                        active_staff = manager.get_active_staff()
+                        if not active_staff:
+                            await websocket.send_json({
+                                "error": True,
+                                "message": "No active staff available"
+                            })
+                            continue
+                        to_user_id = active_staff[0]
+
+                    message = Message(
+                        from_user=user_id,
+                        to_user=to_user_id,
+                        content=content,
+                        timestamp=datetime.now(),
+                        message_type=MessageType[message_type.upper()],
+                        file_path=file_data.get("file_path") if file_data else None,
+                        file_name=file_data.get("file_name") if file_data else None,
+                        mime_type=file_data.get("mime_type") if file_data else None
+                    )
+
+                    await manager.send_message(message, chat_id)
+
+                except WebSocketDisconnect:
+                    raise
+                except Exception as e:
+                    print(f"Error processing message: {str(e)}")
+                    await websocket.send_json({
+                        "error": True,
+                        "message": "Error processing message"
+                    })
+
+        except WebSocketDisconnect:
+            raise
 
     except WebSocketDisconnect:
         await manager.disconnect(user_id)
+        print(f"WebSocket disconnected for user {user_id}")
     except Exception as e:
         print(f"Error in websocket: {str(e)}")
-        await websocket.close(code=4000, reason="Internal server error")
+        try:
+            await websocket.close(code=4000, reason="Internal server error")
+        except:
+            pass
+    finally:
+        await manager.disconnect(user_id)
 
 
 @router.post("/")
@@ -230,7 +304,7 @@ async def telegram_webhook(update: dict):
             mime_type=mime_type
         )
 
-        success = await manager.send_message_to_active_admin(message)
+        success = await manager.send_message_to_active_staff(message)
         if not success:
             return {"status": "no_active_admins"}
 
@@ -243,22 +317,25 @@ async def telegram_webhook(update: dict):
 
 @router.post("/register/staff")
 async def register_staff(
-        data: StaffRegistration,
-        api_key: str = Header(...)
+        data: StaffRegistration
 ):
     try:
         if data.user_type not in ["admin", "mechanic"]:
             raise HTTPException(status_code=400, detail="Invalid user type")
 
+        api_key = f"{data.user_type}_{data.name}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
         user = User(
             id=f"{data.user_type}_{data.name}",
             type=UserType[data.user_type.upper()],
-            api_key=api_key
+            api_key=api_key,
+            name=data.name
         )
         await manager.register_user(user)
         return {
             "status": "success",
             "user_id": user.id,
+            "api_key": api_key,  # Повертаємо згенерований API key
             "message": f"Successfully registered {data.user_type} {data.name}"
         }
     except Exception as e:
@@ -283,165 +360,6 @@ async def register_customer(
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/messages/manager-history")
-async def get_manager_message_history(
-    target_type: str,  # "mechanic", "customer"
-    target_identifier: str,  # api_key for mechanic, phone/telegram_id for customer
-    api_key: str = Header(...)
-):
-    """Get complete message history between a manager and a target user (mechanic or customer)"""
-    manager_user = manager.get_user_by_api_key(api_key)
-    if not manager_user or manager_user.type != UserType.ADMIN:
-        raise HTTPException(status_code=403, detail="Invalid manager credentials")
-
-    target_user = None
-    if target_type == "mechanic":
-        target_user = manager.get_user_by_api_key(target_identifier)
-        if not target_user or target_user.type != UserType.MECHANIC:
-            raise HTTPException(status_code=404, detail="Mechanic not found")
-    elif target_type == "customer":
-
-        target_user = manager.get_user_by_phone(target_identifier)
-        if not target_user:
-
-            try:
-                telegram_id = int(target_identifier)
-                target_user = manager.get_user_by_telegram_id(telegram_id)
-            except ValueError:
-                pass
-        if not target_user or target_user.type != UserType.CUSTOMER:
-            raise HTTPException(status_code=404, detail="Customer not found")
-    else:
-        raise HTTPException(status_code=400, detail="Invalid target type")
-
-    sent_messages = [
-        msg.to_json() for msg in manager.message_history.get(manager_user.id, [])
-        if msg.to_user == target_user.id
-    ]
-
-    received_messages = [
-        msg.to_json() for msg in manager.message_history.get(target_user.id, [])
-        if msg.to_user == manager_user.id
-    ]
-
-    all_messages = sorted(
-        sent_messages + received_messages,
-        key=lambda x: datetime.fromisoformat(x['timestamp'])
-    )
-
-    return {
-        "status": "success",
-        "messages": all_messages
-    }
-
-
-@router.get("/messages/mechanic-history")
-async def get_mechanic_message_history(
-    target_type: str,  # "manager", "customer"
-    target_identifier: str,
-    api_key: str = Header(...)
-):
-    """Get complete message history between a mechanic and a target user (manager or customer)"""
-    mechanic_user = manager.get_user_by_api_key(api_key)
-    if not mechanic_user or mechanic_user.type != UserType.MECHANIC:
-        raise HTTPException(status_code=403, detail="Invalid mechanic credentials")
-
-    target_user = None
-    if target_type == "manager":
-        target_user = manager.get_user_by_api_key(target_identifier)
-        if not target_user or target_user.type != UserType.ADMIN:
-            raise HTTPException(status_code=404, detail="Manager not found")
-    elif target_type == "customer":
-        target_user = manager.get_user_by_phone(target_identifier)
-        if not target_user:
-            try:
-                telegram_id = int(target_identifier)
-                target_user = manager.get_user_by_telegram_id(telegram_id)
-            except ValueError:
-                pass
-        if not target_user or target_user.type != UserType.CUSTOMER:
-            raise HTTPException(status_code=404, detail="Customer not found")
-    else:
-        raise HTTPException(status_code=400, detail="Invalid target type")
-
-    sent_messages = [
-        msg.to_json() for msg in manager.message_history.get(mechanic_user.id, [])
-        if msg.to_user == target_user.id
-    ]
-
-    received_messages = [
-        msg.to_json() for msg in manager.message_history.get(target_user.id, [])
-        if msg.to_user == mechanic_user.id
-    ]
-
-
-    all_messages = sorted(
-        sent_messages + received_messages,
-        key=lambda x: datetime.fromisoformat(x['timestamp'])
-    )
-
-    return {
-        "status": "success",
-        "messages": all_messages
-    }
-
-
-@router.get("/messages/customer-history")
-async def get_customer_message_history(
-    target_type: str,  # "manager", "mechanic"
-    target_identifier: str,  # api_key
-    identifier: str,
-    identifier_type: str = "phone"  # Can be "phone" or "telegram"
-):
-    """Get complete message history between a customer and a target user (manager or mechanic)"""
-    customer_user = None
-    if identifier_type == "phone":
-        customer_user = manager.get_user_by_phone(identifier)
-    elif identifier_type == "telegram":
-        try:
-            telegram_id = int(identifier)
-            customer_user = manager.get_user_by_telegram_id(telegram_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid Telegram ID format")
-    else:
-        raise HTTPException(status_code=400, detail="Invalid identifier type")
-
-    if not customer_user or customer_user.type != UserType.CUSTOMER:
-        raise HTTPException(status_code=404, detail="Customer not found")
-
-    target_user = None
-    if target_type == "manager":
-        target_user = manager.get_user_by_api_key(target_identifier)
-        if not target_user or target_user.type != UserType.ADMIN:
-            raise HTTPException(status_code=404, detail="Manager not found")
-    elif target_type == "mechanic":
-        target_user = manager.get_user_by_api_key(target_identifier)
-        if not target_user or target_user.type != UserType.MECHANIC:
-            raise HTTPException(status_code=404, detail="Mechanic not found")
-    else:
-        raise HTTPException(status_code=400, detail="Invalid target type")
-
-    sent_messages = [
-        msg.to_json() for msg in manager.message_history.get(customer_user.id, [])
-        if msg.to_user == target_user.id
-    ]
-
-    received_messages = [
-        msg.to_json() for msg in manager.message_history.get(target_user.id, [])
-        if msg.to_user == customer_user.id
-    ]
-
-    all_messages = sorted(
-        sent_messages + received_messages,
-        key=lambda x: datetime.fromisoformat(x['timestamp'])
-    )
-
-    return {
-        "status": "success",
-        "messages": all_messages
-    }
 
 
 @router.get("/test")
@@ -483,7 +401,6 @@ async def upload_file(
         mime_type=file.content_type
     )
 
-
     await manager.send_message(message)
 
     return {"status": "success", "message": message.to_json()}
@@ -513,3 +430,100 @@ async def get_file(message_type: str, filename: str):
         raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(filepath)
+
+
+@router.get("/chats")
+async def get_chats(api_key: str = Header(...)):
+    """Get all chats for staff member (admin or mechanic)"""
+    user = manager.get_user_by_api_key(api_key)
+    if not user or user.type not in [UserType.ADMIN, UserType.MECHANIC]:
+        raise HTTPException(status_code=403, detail="Only staff members can view chats")
+
+    chats = manager.chat_manager.get_admin_chats(user.id)
+    return {
+        "status": "success",
+        "chats": [chat.dict() for chat in chats]
+    }
+
+
+@router.get("/chats/{chat_id}")
+async def get_chat_details(
+        chat_id: str,
+        api_key: Optional[str] = Header(None),
+        phone: Optional[str] = Header(None)
+):
+    """Get chat details and messages"""
+    # Check authentication using either API key or phone
+    user = None
+    if api_key:
+        user = manager.get_user_by_api_key(api_key)
+    if not user and phone:
+        user = manager.get_user_by_phone(phone)
+    if not user:
+        raise HTTPException(status_code=403, detail="Authentication failed")
+
+    chat = manager.chat_manager.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    # Modified access check - allow access if user is either the staff member (admin/mechanic) or the customer
+    if user.id == chat.admin_id or user.id == chat.customer_id:
+        messages = manager.chat_manager.get_chat_messages(chat_id)
+
+        # Mark messages as read if staff member is viewing
+        if user.type in [UserType.ADMIN, UserType.MECHANIC]:
+            await manager.chat_manager.mark_chat_as_read(chat_id, user.id)
+
+        return {
+            "status": "success",
+            "chat": chat.dict(),
+            "messages": [msg.to_json() for msg in messages]
+        }
+    else:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+@router.post("/chats/{chat_id}/messages")
+async def send_chat_message(
+        chat_id: str,
+        message_content: str = Form(...),
+        file: Optional[UploadFile] = File(None),
+        api_key: str = Header(...)
+):
+    """Send message to specific chat"""
+    user = manager.get_user_by_api_key(api_key)
+    if not user:
+        raise HTTPException(status_code=403, detail="Authentication failed")
+
+    chat = manager.chat_manager.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    # Визначаємо отримувача
+    to_user = chat.customer_id if user.id == chat.admin_id else chat.admin_id
+
+    message_type = MessageType.TEXT
+    file_path = None
+    file_name = None
+    mime_type = None
+
+    if file:
+        message_type = MessageType[file.content_type.split('/')[0].upper()]
+        FileManager.validate_file(file, message_type)
+        file_path, file_name = await FileManager.save_file(file, message_type)
+        mime_type = file.content_type
+
+    message = Message(
+        from_user=user.id,
+        to_user=to_user,
+        content=message_content,
+        timestamp=datetime.now(),
+        message_type=message_type,
+        file_path=file_path,
+        file_name=file_name,
+        mime_type=mime_type
+    )
+
+    await manager.send_message(message, chat_id)
+
+    return {"status": "success", "message": message.to_json()}
