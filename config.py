@@ -13,3 +13,7 @@ ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif"}
 ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/ogg"}
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/mpeg", "video/webm"}
 ALLOWED_VOICE_TYPES = {"audio/ogg", "audio/webm"}
+
+# MongoDB configuration
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017/")
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "chat_system")

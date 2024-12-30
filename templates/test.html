@@ -79,6 +79,12 @@
             padding: 10px;
         }
 
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+
         input, button {
             padding: 8px;
             margin: 5px 0;
@@ -386,12 +392,12 @@
 
                     data.chats.forEach(chat => {
                         const div = document.createElement('div');
-                        div.className = 'chat-item' + (currentChat && currentChat.id === chat.id ? ' active' : '');
+                        div.className = 'chat-item' + (currentChat && currentChat.chat_id === chat.chat_id ? ' active' : '');
                         div.textContent = chat.title || `Чат з ${chat.customer_id}`;
                         if (chat.unread_count > 0) {
                             div.textContent += ` (${chat.unread_count})`;
                         }
-                        div.onclick = () => loadChat(chat.id);
+                        div.onclick = () => loadChat(chat.chat_id);
                         chatList.appendChild(div);
                     });
                 }
@@ -401,11 +407,23 @@
         }
 
         async function loadChat(chatId) {
+            showLoading();
+            if (!chatId) {
+                console.error('Chat ID is undefined');
+                return;
+            }
+
             try {
+                const headers = {};
+                if (currentUser.api_key) {
+                    headers['api-key'] = currentUser.api_key;
+                }
+                if (currentUser.phone) {
+                    headers['phone'] = currentUser.phone;
+                }
+
                 const response = await fetch(`/chats/${chatId}`, {
-                    headers: {
-                        'api-key': currentUser.api_key
-                    }
+                    headers: headers
                 });
 
                 const data = await response.json();
@@ -419,20 +437,46 @@
 
                     data.messages.forEach(displayMessage);
 
-                    const chatItems = document.querySelectorAll('.chat-item');
-                    chatItems.forEach(item => {
-                        item.classList.remove('active');
-                        if (item.textContent === (currentChat.title || `Чат з ${currentChat.customer_id}`)) {
-                            item.classList.add('active');
-                        }
-                    });
+                    // Оновлюємо активний чат в інтерфейсі тільки для адміністраторів
+                    if (currentUser.user_type === 'admin' || currentUser.user_type === 'mechanic') {
+                        const chatItems = document.querySelectorAll('.chat-item');
+                        chatItems.forEach(item => {
+                            item.classList.remove('active');
+                            if (currentChat && item.textContent === (currentChat.title || `Чат з ${currentChat.customer_id}`)) {
+                                item.classList.add('active');
+                            }
+                        });
+                    }
                 }
             } catch (error) {
                 console.error('Error loading chat:', error);
+            } finally {
+                hideLoading();
+            }
+        }
+        async function loadCustomerChat() {
+            if (!currentUser || currentUser.user_type !== 'customer') return;
+
+            try {
+                // Спробуємо знайти чат за номером телефону клієнта
+                const response = await fetch(`/chats`, {
+                    headers: {
+                        'phone': currentUser.phone
+                    }
+                });
+
+                const data = await response.json();
+                if (response.ok && data.chats && data.chats.length > 0) {
+                    // Беремо перший активний чат
+                    const chat = data.chats[0];
+                    await loadChat(chat.chat_id);
+                }
+            } catch (error) {
+                console.error('Error loading customer chat:', error);
             }
         }
 
-        function displayMessage(message) {
+         function displayMessage(message) {
             if (message.chat_id && !currentChat) {
                 if (currentUser.user_type === 'admin') {
                     const chatList = document.getElementById('chatList');
@@ -458,7 +502,7 @@
 
             if (message.message_type === 'text') {
                 div.textContent = content;
-            } else {
+            } else if (message.file_name) { // Check if file_name exists before trying to use it
                 const mediaUrl = message.local_file_url || `/files/${message.message_type}/${message.file_name}`;
                 switch(message.message_type) {
                     case 'image':
@@ -474,6 +518,8 @@
                     default:
                         div.innerHTML = `<a href="${mediaUrl}" target="_blank">Завантажити файл</a><br>${content}`;
                 }
+            } else {
+                div.textContent = content;
             }
 
             messagesContainer.appendChild(div);
@@ -499,7 +545,17 @@
             try {
                 let to_user;
                 if (currentUser.user_type === 'admin' || currentUser.user_type === 'mechanic') {
-                    to_user = currentChat ? currentChat.customer_id : null;
+                    // For staff members, make sure we're using the correct recipient ID
+                    if (currentChat) {
+                        // Extract the actual user ID from telegram_user_id format
+                        if (currentChat.customer_id.startsWith('telegram_')) {
+                            to_user = currentChat.customer_id;
+                        } else {
+                            to_user = currentChat.customer_id;
+                        }
+                    } else {
+                        to_user = null;
+                    }
                 } else {
                     to_user = 'admin';
                 }
@@ -522,7 +578,7 @@
                         content: input.value || file.name,
                         timestamp: timestamp,
                         message_type: messageType,
-                        chat_id: currentChat ? currentChat.id : null,
+                        chat_id: currentChat ? currentChat.chat_id : null,
                         file_name: file.name,
                         local_file_url: URL.createObjectURL(file)
                     };
@@ -552,7 +608,7 @@
                         content: input.value,
                         timestamp: timestamp,
                         message_type: 'text',
-                        chat_id: currentChat ? currentChat.id : null
+                        chat_id: currentChat ? currentChat.chat_id : null
                     };
                     displayMessage(localMessage);
 
@@ -560,7 +616,7 @@
                         to_user: to_user,
                         content: input.value,
                         message_type: 'text',
-                        chat_id: currentChat ? currentChat.id : null
+                        chat_id: currentChat ? currentChat.chat_id : null
                     };
 
                     ws.send(JSON.stringify(message));
@@ -575,6 +631,17 @@
                 errorDiv.className = 'error-message';
                 errorDiv.textContent = 'Помилка відправки повідомлення';
                 document.getElementById('messagesContainer').appendChild(errorDiv);
+            }
+        }
+        function showLoading() {
+            const messagesContainer = document.getElementById('messagesContainer');
+            messagesContainer.innerHTML = '<div class="loading">Завантаження повідомлень...</div>';
+        }
+
+        function hideLoading() {
+            const loadingEl = document.querySelector('.loading');
+            if (loadingEl) {
+                loadingEl.remove();
             }
         }
 
@@ -598,6 +665,8 @@
                     showChat();
                     if (currentUser.user_type === 'admin' || currentUser.user_type === 'mechanic') {
                         loadStaffChats();
+                    } else if (currentUser.user_type === 'customer') {
+                        loadCustomerChat(); // Додаємо завантаження чату для клієнта
                     }
                 } catch (error) {
                     console.error('Error restoring session:', error);

@@ -1,21 +1,25 @@
-import os
+import traceback
 from datetime import datetime
+import os
+from typing import Optional, Union
 
 import requests
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Header, HTTPException, Request, UploadFile, Form, File
-from typing import Optional, Union
-
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from jose import JWTError, jwt
 
 from auth import create_access_token, SECRET_KEY, ALGORITHM
 from config import UPLOAD_DIR, TELEGRAM_API_URL, TELEGRAM_TOKEN
-from managers import ConnectionManager, Message, User, UserType, MessageType, FileManager
+from managers import ConnectionManager, ChatManager, FileManager, Message, User, UserType, MessageType
+from mongodb_manager import MongoDBManager
 
 router = APIRouter()
-manager = ConnectionManager()
+db_manager = MongoDBManager()
+connection_manager = ConnectionManager(db_manager)
+chat_manager = ChatManager(db_manager)
+file_manager = FileManager()
 templates = Jinja2Templates(directory="templates")
 
 
@@ -29,23 +33,31 @@ class CustomerRegistration(BaseModel):
     phone: str
 
 
-async def get_token(
-        websocket: WebSocket,
+async def get_user_from_credentials(
         api_key: Optional[str] = None,
         phone: Optional[str] = None,
 ) -> Union[User, None]:
-    if not api_key and not phone:
-        return None
-
     if api_key:
-        user = manager.get_user_by_api_key(api_key)
-        if user:
-            return user
+        user_data = await db_manager.get_user_by_field("api_key", api_key)
+        if user_data:
+            return User(
+                id=user_data["user_id"],
+                type=UserType[user_data["type"].upper()],
+                api_key=user_data.get("api_key"),
+                phone=user_data.get("phone"),
+                telegram_id=user_data.get("telegram_id")
+            )
 
     if phone:
-        user = manager.get_user_by_phone(phone)
-        if user:
-            return user
+        user_data = await db_manager.get_user_by_field("phone", phone)
+        if user_data:
+            return User(
+                id=user_data["user_id"],
+                type=UserType[user_data["type"].upper()],
+                api_key=user_data.get("api_key"),
+                phone=user_data.get("phone"),
+                telegram_id=user_data.get("telegram_id")
+            )
 
     return None
 
@@ -80,16 +92,10 @@ async def download_telegram_file(file_id: str) -> tuple[bytes, str, str]:
 
 @router.post("/login")
 async def login(api_key: Optional[str] = None, phone: Optional[str] = None):
-    user = None
-    if api_key:
-        user = manager.get_user_by_api_key(api_key)
-    elif phone:
-        user = manager.get_user_by_phone(phone)
-
+    user = await get_user_from_credentials(api_key, phone)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Create access token
     token_data = {
         "sub": user.id,
         "type": user.type.value,
@@ -114,7 +120,6 @@ async def websocket_endpoint(
         phone: Optional[str] = None
 ):
     try:
-        # Перевірка токена з query parameters
         token = websocket.query_params.get("token")
         if token:
             try:
@@ -126,46 +131,62 @@ async def websocket_endpoint(
                 await websocket.close(code=4001, reason="Authentication failed")
                 return
         else:
-            # Альтернативна аутентифікація через API-ключ або телефон
-            user = await get_token(websocket, api_key, phone)
+            user = await get_user_from_credentials(api_key, phone)
             if not user or user.id != user_id:
                 await websocket.close(code=4001, reason="Authentication failed")
                 return
 
-        await manager.connect(websocket, user_id)
+        await connection_manager.connect(websocket, user_id)
+        print(f"User {user_id} connected to WebSocket")
 
         try:
             while True:
-                try:
-                    data = await websocket.receive_json()
+                data = await websocket.receive_json()
+                print(f"Received message from {user_id}: {data}")
 
-                    if not data:
-                        continue
+                if not data:
+                    continue
 
-                    to_user_id = data.get("to_user")
-                    content = data.get("content")
-                    message_type = data.get("message_type", "text")
-                    file_data = data.get("file_data")
-                    chat_id = data.get("chat_id")
+                content = data.get("content")
+                message_type = data.get("message_type", "text")
+                file_data = data.get("file_data")
+                chat_id = data.get("chat_id")
 
-                    if not content:
+                if not content:
+                    await websocket.send_json({
+                        "error": True,
+                        "message": "Missing content field"
+                    })
+                    continue
+
+                to_user_id = None
+                if user_id.startswith('customer_'):
+
+                    active_staff = await connection_manager.get_active_staff()
+                    print(f"Active staff: {active_staff}")
+                    if not active_staff:
                         await websocket.send_json({
                             "error": True,
-                            "message": "Missing required fields"
+                            "message": "No active staff available"
                         })
                         continue
+                    to_user_id = active_staff[0]
+                else:
 
-                    # Якщо клієнт відправляє повідомлення без вказання to_user_id
-                    if not to_user_id and user_id.startswith('customer_'):
-                        active_staff = manager.get_active_staff()
-                        if not active_staff:
-                            await websocket.send_json({
-                                "error": True,
-                                "message": "No active staff available"
-                            })
-                            continue
-                        to_user_id = active_staff[0]
+                    to_user_id = data.get("to_user")
+                    if chat_id:
+                        chat = await chat_manager.get_chat(chat_id)
+                        if chat:
+                            to_user_id = chat["customer_id"] if user_id == chat["admin_id"] else chat["admin_id"]
 
+                if not to_user_id:
+                    await websocket.send_json({
+                        "error": True,
+                        "message": "Could not determine message recipient"
+                    })
+                    continue
+
+                try:
                     message = Message(
                         from_user=user_id,
                         to_user=to_user_id,
@@ -177,148 +198,57 @@ async def websocket_endpoint(
                         mime_type=file_data.get("mime_type") if file_data else None
                     )
 
-                    await manager.send_message(message, chat_id)
 
-                except WebSocketDisconnect:
-                    raise
-                except Exception as e:
-                    print(f"Error processing message: {str(e)}")
+                    if not chat_id:
+                        chat = await chat_manager.get_or_create_chat(
+                            from_user=user_id,
+                            to_user=to_user_id
+                        )
+                        chat_id = chat["chat_id"]
+
+                    # Send message
+                    print(f"Sending message in chat {chat_id} from {user_id} to {to_user_id}")
+                    await connection_manager.send_message(message, chat_id)
+
+                    # Confirm to sender
+                    await websocket.send_json({
+                        "status": "success",
+                        "message": "Message sent successfully",
+                        "chat_id": chat_id
+                    })
+
+                except ValidationError as e:
+                    print(f"Validation error: {str(e)}")
                     await websocket.send_json({
                         "error": True,
-                        "message": "Error processing message"
+                        "message": f"Validation error: {str(e)}"
+                    })
+                except Exception as e:
+                    print(f"Error sending message: {str(e)}")
+                    await websocket.send_json({
+                        "error": True,
+                        "message": f"Error sending message: {str(e)}"
                     })
 
         except WebSocketDisconnect:
             raise
 
     except WebSocketDisconnect:
-        await manager.disconnect(user_id)
+        await connection_manager.disconnect(user_id)
         print(f"WebSocket disconnected for user {user_id}")
     except Exception as e:
         print(f"Error in websocket: {str(e)}")
+        traceback.print_exc()
         try:
             await websocket.close(code=4000, reason="Internal server error")
         except:
             pass
     finally:
-        await manager.disconnect(user_id)
-
-
-@router.post("/")
-async def telegram_webhook(update: dict):
-    try:
-        chat_id = update["message"]["chat"]["id"]
-        username = update["message"]["from"].get("username", "Unknown")
-
-        user = manager.get_user_by_telegram_id(chat_id)
-        if not user:
-            user = User(
-                id=f"telegram_{chat_id}",
-                type=UserType.CUSTOMER,
-                telegram_id=chat_id,
-                name=username
-            )
-            await manager.register_user(user)
-
-        message_type = MessageType.TEXT
-        content = update["message"].get("text", "")
-        file_path = None
-        relative_path = None
-        file_name = None
-        mime_type = None
-
-        if "photo" in update["message"]:
-            message_type = MessageType.IMAGE
-            photo = update["message"]["photo"][-1]
-            file_id = photo["file_id"]
-            file_content, _, mime_type = await download_telegram_file(file_id)
-            file_path, relative_path = await FileManager.save_telegram_file(
-                file_content,
-                file_id,
-                message_type
-            )
-            content = update["message"].get("caption", "Image")
-            file_name = photo.get("file_name", f"{file_id}.jpg")
-
-        elif "audio" in update["message"]:
-            message_type = MessageType.AUDIO
-            audio = update["message"]["audio"]
-            file_id = audio["file_id"]
-            file_content, _, mime_type = await download_telegram_file(file_id)
-            file_path, relative_path = await FileManager.save_telegram_file(
-                file_content,
-                file_id,
-                message_type
-            )
-            content = update["message"].get("caption", "Audio")
-            file_name = audio.get("file_name", f"{file_id}.mp3")
-
-        elif "voice" in update["message"]:
-            message_type = MessageType.VOICE
-            voice = update["message"]["voice"]
-            file_id = voice["file_id"]
-            file_content, _, mime_type = await download_telegram_file(file_id)
-            file_path, relative_path = await FileManager.save_telegram_file(
-                file_content,
-                file_id,
-                message_type
-            )
-            content = "Voice message"
-            file_name = voice.get("file_name", f"{file_id}.ogg")
-
-        elif "video" in update["message"]:
-            message_type = MessageType.VIDEO
-            video = update["message"]["video"]
-            file_id = video["file_id"]
-            file_content, _, mime_type = await download_telegram_file(file_id)
-            file_path, relative_path = await FileManager.save_telegram_file(
-                file_content,
-                file_id,
-                message_type
-            )
-            content = update["message"].get("caption", "Video")
-            file_name = video.get("file_name", f"{file_id}.mp4")
-
-        elif "document" in update["message"]:
-            message_type = MessageType.FILE
-            document = update["message"]["document"]
-            file_id = document["file_id"]
-            file_content, _, mime_type = await download_telegram_file(file_id)
-            file_path, relative_path = await FileManager.save_telegram_file(
-                file_content,
-                file_id,
-                message_type
-            )
-            content = update["message"].get("caption", "Document")
-            file_name = document.get("file_name", f"{file_id}_file")
-
-        message = Message(
-            from_user=user.id,
-            to_user="admin",
-            content=content,
-            timestamp=datetime.now(),
-            source="telegram",
-            message_type=message_type,
-            file_path=relative_path,
-            file_name=file_name,
-            mime_type=mime_type
-        )
-
-        success = await manager.send_message_to_active_staff(message)
-        if not success:
-            return {"status": "no_active_admins"}
-
-        return {"status": "success"}
-
-    except Exception as e:
-        print(f"Error processing telegram webhook: {str(e)}")
-        return {"status": "error", "detail": str(e)}
+        await connection_manager.disconnect(user_id)
 
 
 @router.post("/register/staff")
-async def register_staff(
-        data: StaffRegistration
-):
+async def register_staff(data: StaffRegistration):
     try:
         if data.user_type not in ["admin", "mechanic"]:
             raise HTTPException(status_code=400, detail="Invalid user type")
@@ -331,11 +261,13 @@ async def register_staff(
             api_key=api_key,
             name=data.name
         )
-        await manager.register_user(user)
+
+        await connection_manager.register_user(user)
+
         return {
             "status": "success",
             "user_id": user.id,
-            "api_key": api_key,  # Повертаємо згенерований API key
+            "api_key": api_key,
             "message": f"Successfully registered {data.user_type} {data.name}"
         }
     except Exception as e:
@@ -343,16 +275,15 @@ async def register_staff(
 
 
 @router.post("/register/customer")
-async def register_customer(
-        data: CustomerRegistration
-):
+async def register_customer(data: CustomerRegistration):
     try:
         user = User(
             id=f"customer_{data.phone}",
             type=UserType.CUSTOMER,
-            phone=data.phone
+            phone=data.phone,
+            name=data.name
         )
-        await manager.register_user(user)
+        await connection_manager.register_user(user)
         return {
             "status": "success",
             "user_id": user.id,
@@ -362,21 +293,15 @@ async def register_customer(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/test")
-async def test_page(request: Request):
-    return templates.TemplateResponse("test.html", {"request": request})
-
-
 @router.post("/upload/{message_type}")
 async def upload_file(
-    message_type: str,
-    to_user: str = Form(...),
-    file: UploadFile = File(...),
-    api_key: Optional[str] = Header(None),
-    phone: Optional[str] = Header(None)
+        message_type: str,
+        to_user: str = Form(...),
+        file: UploadFile = File(...),
+        api_key: Optional[str] = Header(None),
+        phone: Optional[str] = Header(None)
 ):
-    """Upload media file and send it as a message"""
-    user = await get_token(None, api_key, phone)
+    user = await get_user_from_credentials(api_key, phone)
     if not user:
         raise HTTPException(status_code=403, detail="Authentication failed")
 
@@ -385,11 +310,9 @@ async def upload_file(
     except KeyError:
         raise HTTPException(status_code=400, detail="Invalid message type")
 
+    file_manager.validate_file(file, msg_type)
+    filepath, filename = await file_manager.save_file(file, msg_type)
 
-    FileManager.validate_file(file, msg_type)
-    filepath, filename = await FileManager.save_file(file, msg_type)
-
-    # Create message
     message = Message(
         from_user=user.id,
         to_user=to_user,
@@ -401,24 +324,21 @@ async def upload_file(
         mime_type=file.content_type
     )
 
-    await manager.send_message(message)
+    await connection_manager.send_message(message)
 
     return {"status": "success", "message": message.to_json()}
 
 
 @router.get("/files/{message_type}/{filename}")
 async def get_file(message_type: str, filename: str):
-    """Retrieve uploaded file"""
     try:
         msg_type = MessageType[message_type.upper()]
     except KeyError:
         raise HTTPException(status_code=400, detail="Invalid message type")
 
-
     filepath = os.path.join(UPLOAD_DIR, msg_type.value, filename)
 
     if not os.path.exists(filepath):
-
         print(f"File not found: {filepath}")
 
         if '_' in filename:
@@ -433,16 +353,23 @@ async def get_file(message_type: str, filename: str):
 
 
 @router.get("/chats")
-async def get_chats(api_key: str = Header(...)):
-    """Get all chats for staff member (admin or mechanic)"""
-    user = manager.get_user_by_api_key(api_key)
-    if not user or user.type not in [UserType.ADMIN, UserType.MECHANIC]:
-        raise HTTPException(status_code=403, detail="Only staff members can view chats")
+async def get_chats(
+    api_key: Optional[str] = Header(None),
+    phone: Optional[str] = Header(None)
+):
+    user = await get_user_from_credentials(api_key=api_key, phone=phone)
+    if not user:
+        raise HTTPException(status_code=403, detail="Authentication failed")
 
-    chats = manager.chat_manager.get_admin_chats(user.id)
+    if user.type in [UserType.ADMIN, UserType.MECHANIC]:
+        chats = await db_manager.get_user_chats(user.id, user.type.value)
+    else:
+
+        chats = await db_manager.get_user_chats(user.id, "customer")
+
     return {
         "status": "success",
-        "chats": [chat.dict() for chat in chats]
+        "chats": chats
     }
 
 
@@ -452,32 +379,24 @@ async def get_chat_details(
         api_key: Optional[str] = Header(None),
         phone: Optional[str] = Header(None)
 ):
-    """Get chat details and messages"""
-    # Check authentication using either API key or phone
-    user = None
-    if api_key:
-        user = manager.get_user_by_api_key(api_key)
-    if not user and phone:
-        user = manager.get_user_by_phone(phone)
+    user = await get_user_from_credentials(api_key, phone)
     if not user:
         raise HTTPException(status_code=403, detail="Authentication failed")
 
-    chat = manager.chat_manager.get_chat(chat_id)
+    chat = await chat_manager.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
 
-    # Modified access check - allow access if user is either the staff member (admin/mechanic) or the customer
-    if user.id == chat.admin_id or user.id == chat.customer_id:
-        messages = manager.chat_manager.get_chat_messages(chat_id)
+    if user.id == chat["admin_id"] or user.id == chat["customer_id"]:
+        messages = await db_manager.get_chat_messages(chat_id)
 
-        # Mark messages as read if staff member is viewing
         if user.type in [UserType.ADMIN, UserType.MECHANIC]:
-            await manager.chat_manager.mark_chat_as_read(chat_id, user.id)
+            await chat_manager.mark_chat_as_read(chat_id, user.id)
 
         return {
             "status": "success",
-            "chat": chat.dict(),
-            "messages": [msg.to_json() for msg in messages]
+            "chat": chat,
+            "messages": messages
         }
     else:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -490,17 +409,18 @@ async def send_chat_message(
         file: Optional[UploadFile] = File(None),
         api_key: str = Header(...)
 ):
-    """Send message to specific chat"""
-    user = manager.get_user_by_api_key(api_key)
+    user = await get_user_from_credentials(api_key=api_key)
     if not user:
         raise HTTPException(status_code=403, detail="Authentication failed")
 
-    chat = manager.chat_manager.get_chat(chat_id)
+    chat = await chat_manager.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
 
-    # Визначаємо отримувача
-    to_user = chat.customer_id if user.id == chat.admin_id else chat.admin_id
+    if user.id != chat["admin_id"] and user.id != chat["customer_id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    to_user = chat["customer_id"] if user.id == chat["admin_id"] else chat["admin_id"]
 
     message_type = MessageType.TEXT
     file_path = None
@@ -508,9 +428,14 @@ async def send_chat_message(
     mime_type = None
 
     if file:
-        message_type = MessageType[file.content_type.split('/')[0].upper()]
-        FileManager.validate_file(file, message_type)
-        file_path, file_name = await FileManager.save_file(file, message_type)
+        file_type = file.content_type.split('/')[0].upper()
+        try:
+            message_type = MessageType[file_type]
+        except KeyError:
+            message_type = MessageType.FILE
+
+        file_manager.validate_file(file, message_type)
+        file_path, file_name = await file_manager.save_file(file, message_type)
         mime_type = file.content_type
 
     message = Message(
@@ -524,6 +449,159 @@ async def send_chat_message(
         mime_type=mime_type
     )
 
-    await manager.send_message(message, chat_id)
+    try:
+        await connection_manager.send_message(message, chat_id)
+        return {"status": "success", "message": message.to_json()}
+    except Exception as e:
+        print(f"Error sending message: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
 
-    return {"status": "success", "message": message.to_json()}
+
+@router.post("/")
+async def telegram_webhook(update: dict):
+    try:
+        chat_id = update["message"]["chat"]["id"]
+        user_id = update["message"]["from"]["id"]
+        username = update["message"]["from"].get("username", "Unknown")
+        first_name = update["message"]["from"].get("first_name", "")
+        last_name = update["message"]["from"].get("last_name", "")
+
+
+        display_name = username if username != "Unknown" else f"{first_name} {last_name}".strip()
+        if not display_name:
+            display_name = f"User_{user_id}"
+
+        telegram_user_id = f"telegram_{user_id}"
+
+        user_data = await connection_manager.get_user_by_telegram_id(user_id)
+        if not user_data:
+            user = User(
+                id=telegram_user_id,
+                type=UserType.CUSTOMER,
+                telegram_id=user_id,
+                name=display_name
+            )
+            await connection_manager.register_user(user)
+
+        existing_chats = await db_manager.get_user_chats(telegram_user_id, "customer")
+        existing_chat = existing_chats[0] if existing_chats else None
+
+
+        active_staff = await connection_manager.get_active_staff()
+        if not active_staff:
+            await connection_manager.send_telegram_message(
+                chat_id,
+                "Sorry, no active staff members are available at the moment."
+            )
+            return {"status": "no_active_admins"}
+
+        if existing_chat:
+            to_user = existing_chat["admin_id"]
+            chat_id_to_use = existing_chat["chat_id"]
+        else:
+            to_user = active_staff[0]
+            new_chat = await chat_manager.create_chat(
+                admin_id=to_user,
+                customer_id=telegram_user_id,
+                title=f"Telegram Chat with {display_name}"
+            )
+            chat_id_to_use = new_chat
+
+        message_type = MessageType.TEXT
+        content = update["message"].get("text", "")
+        file_path = None
+        file_name = None
+        mime_type = None
+
+        if "photo" in update["message"]:
+            message_type = MessageType.IMAGE
+            photo = update["message"]["photo"][-1]
+            file_id = photo["file_id"]
+            file_content, _, mime_type = await download_telegram_file(file_id)
+            file_path, file_name = await file_manager.save_telegram_file(
+                file_content,
+                file_id,
+                message_type
+            )
+            content = update["message"].get("caption", "Image")
+        elif "audio" in update["message"]:
+            message_type = MessageType.AUDIO
+            audio = update["message"]["audio"]
+            file_id = audio["file_id"]
+            file_content, _, mime_type = await download_telegram_file(file_id)
+            file_path, file_name = await file_manager.save_telegram_file(
+                file_content,
+                file_id,
+                message_type
+            )
+            content = update["message"].get("caption", "Audio")
+        elif "voice" in update["message"]:
+            message_type = MessageType.VOICE
+            voice = update["message"]["voice"]
+            file_id = voice["file_id"]
+            file_content, _, mime_type = await download_telegram_file(file_id)
+            file_path, file_name = await file_manager.save_telegram_file(
+                file_content,
+                file_id,
+                message_type
+            )
+            content = "Voice message"
+        elif "video" in update["message"]:
+            message_type = MessageType.VIDEO
+            video = update["message"]["video"]
+            file_id = video["file_id"]
+            file_content, _, mime_type = await download_telegram_file(file_id)
+            file_path, file_name = await file_manager.save_telegram_file(
+                file_content,
+                file_id,
+                message_type
+            )
+            content = update["message"].get("caption", "Video")
+        elif "document" in update["message"]:
+            message_type = MessageType.FILE
+            document = update["message"]["document"]
+            file_id = document["file_id"]
+            file_content, _, mime_type = await download_telegram_file(file_id)
+            file_path, file_name = await file_manager.save_telegram_file(
+                file_content,
+                file_id,
+                message_type
+            )
+            content = update["message"].get("caption", "Document")
+
+        message = Message(
+            from_user=telegram_user_id,
+            to_user=to_user,
+            content=content,
+            timestamp=datetime.now(),
+            source="telegram",
+            message_type=message_type,
+            file_path=file_path,
+            file_name=file_name,
+            mime_type=mime_type
+        )
+
+        # Store the chat_id mapping for future responses
+        if not hasattr(message, '_telegram_chat_id'):
+            setattr(message, '_telegram_chat_id', chat_id)
+
+        await connection_manager.send_message(message, chat_id_to_use)
+        return {"status": "success"}
+
+    except Exception as e:
+        print(f"Error processing telegram webhook: {str(e)}")
+        traceback.print_exc()
+        try:
+            await connection_manager.send_telegram_message(
+                chat_id,
+                "Sorry, there was an error processing your message."
+            )
+        except:
+            pass
+        return {"status": "error", "detail": str(e)}
+
+
+@router.get("/test")
+async def test_page(request: Request):
+    """Test page endpoint"""
+    return templates.TemplateResponse("test.html", {"request": request})
