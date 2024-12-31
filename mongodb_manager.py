@@ -1,3 +1,4 @@
+import traceback
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pymongo import MongoClient
@@ -25,6 +26,8 @@ class MongoDBManager:
         self.chats: Collection = self.db.chats
         self.messages: Collection = self.db.messages
         self.active_connections: Dict[str, Any] = {}
+        self.comments = self.db.comments
+        self.message_templates = self.db.message_templates
 
         self.users.drop_indexes()
 
@@ -42,6 +45,9 @@ class MongoDBManager:
         self.messages.create_index("chat_id")
         self.messages.create_index("timestamp")
 
+        self.comments.create_index([("chat_id", 1), ("timestamp", 1)])
+        self.message_templates.create_index("created_by")
+
     async def create_user(self, user_data: dict) -> str:
         """Create a new user in the database"""
         user_doc = {
@@ -50,7 +56,6 @@ class MongoDBManager:
             "created_at": datetime.now()
         }
 
-        # Add optional fields only if they have values
         if user_data.get("api_key"):
             user_doc["api_key"] = user_data["api_key"]
 
@@ -71,22 +76,80 @@ class MongoDBManager:
         """Get user by any field (api_key, phone, telegram_id, etc.)"""
         return self.users.find_one({field: value})
 
-    async def create_chat(self, admin_id: str, customer_id: str, title: Optional[str] = None) -> str:
-        """Create a new chat"""
+    async def create_chat(self, **kwargs) -> str:
         chat_doc = {
             "chat_id": f"chat_{ObjectId()}",
-            "admin_id": admin_id,
-            "customer_id": customer_id,
-            "status": "active",
+            "admin_id": kwargs["admin_id"],
+            "customer_id": kwargs["customer_id"],
+            "status": kwargs.get("status", "new"),
+            "priority": kwargs.get("priority", "normal"),
+            "source": kwargs.get("source", "web"),
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
-            "title": title or f"Chat with {customer_id}",
+            "title": kwargs.get("title") or f"Chat with {kwargs['customer_id']}",
             "unread_count": 0,
             "last_message": None
         }
 
         result = self.chats.insert_one(chat_doc)
         return chat_doc["chat_id"]
+
+    async def update_chat(self, chat_id: str, update_data: dict) -> None:
+        self.chats.update_one(
+            {"chat_id": chat_id},
+            {
+                "$set": {
+                    **update_data,
+                    "updated_at": datetime.now()
+                }
+            }
+        )
+
+    async def add_comment(self, comment_data: dict) -> str:
+        result = self.comments.insert_one(comment_data)
+        return str(result.inserted_id)
+
+    async def get_chat_comments(self, chat_id: str) -> List[dict]:
+        comments = list(self.comments.find({"chat_id": chat_id}).sort("timestamp", 1))
+        return [convert_object_id(comment) for comment in comments]
+
+    async def create_message_template(self, template_data: dict) -> str:
+        result = self.message_templates.insert_one(template_data)
+        return str(result.inserted_id)
+
+    async def get_message_templates(self, user_id: str) -> List[dict]:
+        templates = list(self.message_templates.find({"created_by": user_id}))
+        return [convert_object_id(template) for template in templates]
+
+    async def get_filtered_chats(
+            self,
+            status: Optional[str] = None,
+            priority: Optional[str] = None,
+            source: Optional[str] = None,
+            admin_id: Optional[str] = None,
+    ) -> List[dict]:
+        try:
+            query = {}
+
+            if status:
+                query["status"] = status.lower()
+            if priority:
+                query["priority"] = priority.lower()
+            if source:
+                query["source"] = source.lower()
+            if admin_id:
+                query["admin_id"] = admin_id
+
+
+            # Execute the query and sort by updated_at in descending order
+            chats = list(self.chats.find(query).sort("updated_at", -1))
+
+            return [convert_object_id(chat) for chat in chats]
+
+        except Exception as e:
+            print(f"Error in get_filtered_chats: {str(e)}")
+            traceback.print_exc()
+            return []
 
     async def get_chat(self, chat_id: str) -> Optional[dict]:
         """Get chat by ID"""
@@ -97,13 +160,16 @@ class MongoDBManager:
 
     async def get_user_chats(self, user_id: str, user_type: str) -> List[dict]:
         """Get all chats for a user based on their type"""
-        query = {"admin_id": user_id} if user_type in ["admin", "mechanic"] else {"customer_id": user_id}
-        chats = list(self.chats.find(query).sort("updated_at"))
+        if user_type in ["admin", "mechanic"]:
+            query = {}
+        else:
+            query = {"customer_id": user_id}
+
+        chats = list(self.chats.find(query).sort("updated_at", -1))
         return [convert_object_id(chat) for chat in chats]
 
     async def get_chat_by_users(self, user1_id: str, user2_id: str) -> Optional[dict]:
         """Get chat by two user IDs"""
-        # Check both combinations since we don't know who is admin and who is customer
         chat = self.chats.find_one({
             "$or": [
                 {"admin_id": user1_id, "customer_id": user2_id},
@@ -111,6 +177,12 @@ class MongoDBManager:
             ]
         })
         return chat
+
+    def update_chat_admin(self, chat_id: str, admin_id: str):
+        return self.chats.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"admin_id": admin_id}}
+        )
 
     async def add_message(self, chat_id: str, message_data: dict) -> str:
         """Add a new message to a chat"""

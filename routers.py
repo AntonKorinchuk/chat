@@ -1,10 +1,11 @@
 import traceback
 from datetime import datetime
 import os
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Any
 
 import requests
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Header, HTTPException, Request, UploadFile, Form, File
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Header, HTTPException, Request, UploadFile, Form, File, \
+    Query
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ValidationError
@@ -12,7 +13,7 @@ from jose import JWTError, jwt
 
 from auth import create_access_token, SECRET_KEY, ALGORITHM
 from config import UPLOAD_DIR, TELEGRAM_API_URL, TELEGRAM_TOKEN
-from managers import ConnectionManager, ChatManager, FileManager, Message, User, UserType, MessageType
+from managers import ConnectionManager, ChatManager, FileManager, Message, User, UserType, MessageType, ChatStatus
 from mongodb_manager import MongoDBManager
 
 router = APIRouter()
@@ -20,7 +21,7 @@ db_manager = MongoDBManager()
 connection_manager = ConnectionManager(db_manager)
 chat_manager = ChatManager(db_manager)
 file_manager = FileManager()
-templates = Jinja2Templates(directory="templates")
+template = Jinja2Templates(directory="templates")
 
 
 class StaffRegistration(BaseModel):
@@ -373,6 +374,36 @@ async def get_chats(
     }
 
 
+@router.get("/chats/filtered")
+async def get_filtered_chats(
+        status: Optional[str] = Query(None),
+        priority: Optional[str] = Query(None),
+        source: Optional[str] = Query(None),
+        admin_id: Optional[str] = Query(None),
+        api_key: Optional[str] = Header(None)
+):
+    user = await get_user_from_credentials(api_key=api_key)
+    if not user or user.type not in [UserType.ADMIN, UserType.MECHANIC]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    try:
+        print(f"Filtering chats with parameters: status={status}, priority={priority}, source={source}, admin_id={admin_id}")
+
+        chats = await db_manager.get_filtered_chats(
+            status=status,
+            priority=priority,
+            source=source,
+            admin_id=admin_id
+        )
+
+        return {"status": "success", "chats": chats}
+
+    except Exception as e:
+        print(f"Error in get_filtered_chats endpoint: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/chats/{chat_id}")
 async def get_chat_details(
         chat_id: str,
@@ -387,7 +418,7 @@ async def get_chat_details(
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
 
-    if user.id == chat["admin_id"] or user.id == chat["customer_id"]:
+    if user.type in [UserType.ADMIN, UserType.MECHANIC] or user.id == chat["customer_id"]:
         messages = await db_manager.get_chat_messages(chat_id)
 
         if user.type in [UserType.ADMIN, UserType.MECHANIC]:
@@ -402,61 +433,6 @@ async def get_chat_details(
         raise HTTPException(status_code=403, detail="Access denied")
 
 
-@router.post("/chats/{chat_id}/messages")
-async def send_chat_message(
-        chat_id: str,
-        message_content: str = Form(...),
-        file: Optional[UploadFile] = File(None),
-        api_key: str = Header(...)
-):
-    user = await get_user_from_credentials(api_key=api_key)
-    if not user:
-        raise HTTPException(status_code=403, detail="Authentication failed")
-
-    chat = await chat_manager.get_chat(chat_id)
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
-
-    if user.id != chat["admin_id"] and user.id != chat["customer_id"]:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    to_user = chat["customer_id"] if user.id == chat["admin_id"] else chat["admin_id"]
-
-    message_type = MessageType.TEXT
-    file_path = None
-    file_name = None
-    mime_type = None
-
-    if file:
-        file_type = file.content_type.split('/')[0].upper()
-        try:
-            message_type = MessageType[file_type]
-        except KeyError:
-            message_type = MessageType.FILE
-
-        file_manager.validate_file(file, message_type)
-        file_path, file_name = await file_manager.save_file(file, message_type)
-        mime_type = file.content_type
-
-    message = Message(
-        from_user=user.id,
-        to_user=to_user,
-        content=message_content,
-        timestamp=datetime.now(),
-        message_type=message_type,
-        file_path=file_path,
-        file_name=file_name,
-        mime_type=mime_type
-    )
-
-    try:
-        await connection_manager.send_message(message, chat_id)
-        return {"status": "success", "message": message.to_json()}
-    except Exception as e:
-        print(f"Error sending message: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
-
-
 @router.post("/")
 async def telegram_webhook(update: dict):
     try:
@@ -465,7 +441,6 @@ async def telegram_webhook(update: dict):
         username = update["message"]["from"].get("username", "Unknown")
         first_name = update["message"]["from"].get("first_name", "")
         last_name = update["message"]["from"].get("last_name", "")
-
 
         display_name = username if username != "Unknown" else f"{first_name} {last_name}".strip()
         if not display_name:
@@ -486,7 +461,6 @@ async def telegram_webhook(update: dict):
         existing_chats = await db_manager.get_user_chats(telegram_user_id, "customer")
         existing_chat = existing_chats[0] if existing_chats else None
 
-
         active_staff = await connection_manager.get_active_staff()
         if not active_staff:
             await connection_manager.send_telegram_message(
@@ -503,7 +477,8 @@ async def telegram_webhook(update: dict):
             new_chat = await chat_manager.create_chat(
                 admin_id=to_user,
                 customer_id=telegram_user_id,
-                title=f"Telegram Chat with {display_name}"
+                title=f"Telegram Chat with {display_name}",
+                source = "telegram"
             )
             chat_id_to_use = new_chat
 
@@ -604,4 +579,76 @@ async def telegram_webhook(update: dict):
 @router.get("/test")
 async def test_page(request: Request):
     """Test page endpoint"""
-    return templates.TemplateResponse("test.html", {"request": request})
+    return template.TemplateResponse("test.html", {"request": request})
+
+
+@router.put("/chats/{chat_id}/status")
+async def update_chat_status(
+        chat_id: str,
+        status: str,
+        api_key: Optional[str] = Header(None)
+):
+    user = await get_user_from_credentials(api_key=api_key)
+    if not user or user.type not in [UserType.ADMIN, UserType.MECHANIC]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    try:
+        new_status = ChatStatus[status.upper()]
+        await chat_manager.update_chat_status(chat_id, new_status)
+        return {"status": "success", "message": f"Chat status updated to {status}"}
+    except KeyError:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+
+@router.post("/chats/{chat_id}/comments")
+async def add_chat_comment(
+        chat_id: str,
+        content: str,
+        api_key: Optional[str] = Header(None)
+):
+    user = await get_user_from_credentials(api_key=api_key)
+    if not user or user.type not in [UserType.ADMIN, UserType.MECHANIC]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    comment_id = await chat_manager.add_comment(chat_id, user.id, content)
+    return {"status": "success", "comment_id": comment_id}
+
+
+@router.get("/chats/{chat_id}/comments")
+async def get_chat_comments(
+        chat_id: str,
+        api_key: Optional[str] = Header(None)
+):
+    user = await get_user_from_credentials(api_key=api_key)
+    if not user or user.type not in [UserType.ADMIN, UserType.MECHANIC]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    comments = await chat_manager.get_chat_comments(chat_id)
+    return {"status": "success", "comments": comments}
+
+
+@router.post("/message-templates")
+async def create_message_template(
+        name: str = Form(...),
+        content: str = Form(...),
+        api_key: Optional[str] = Header(None)
+):
+    user = await get_user_from_credentials(api_key=api_key)
+    if not user or user.type not in [UserType.ADMIN, UserType.MECHANIC]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    template_id = await chat_manager.create_message_template(name, content, user.id)
+    return {"status": "success", "template_id": template_id}
+
+
+@router.get("/message-templates")
+async def get_message_templates(
+        api_key: Optional[str] = Header(None)
+):
+    user = await get_user_from_credentials(api_key=api_key)
+    if not user or user.type not in [UserType.ADMIN, UserType.MECHANIC]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    templates = await chat_manager.get_message_templates(user.id)
+    return {"status": "success", "templates": templates}
+

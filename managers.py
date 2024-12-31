@@ -66,6 +66,33 @@ class Message(BaseModel):
         }
 
 
+class ChatStatus(Enum):
+    NEW = "new"
+    IN_PROGRESS = "in_progress"
+    CLOSED = "closed"
+
+
+class ChatPriority(Enum):
+    NORMAL = "normal"
+    HIGH = "high"
+    VIP = "vip"
+
+
+class Comment(BaseModel):
+    chat_id: str
+    user_id: str
+    content: str
+    timestamp: datetime
+
+
+class ChatTemplate(BaseModel):
+    id: str
+    name: str
+    content: str
+    created_by: str
+    created_at: datetime
+
+
 class ConnectionManager:
     def __init__(self, db_manager: 'MongoDBManager'):
         self.db = db_manager
@@ -88,7 +115,7 @@ class ConnectionManager:
             return None
 
         return User(
-            id=str(user_data.get('_id')),  # Convert ObjectId to string
+            id=str(user_data.get('_id')),
             type=UserType[user_data.get('type', 'CUSTOMER').upper()],
             telegram_id=user_data.get('telegram_id'),
             name=user_data.get('name', 'Unknown')
@@ -162,7 +189,6 @@ class ConnectionManager:
             return response.json()
 
         except Exception as e:
-            print(f"Error in send_telegram_message: {str(e)}")
             url = f"{TELEGRAM_API_URL}/sendMessage"
             data = {
                 "chat_id": chat_id,
@@ -173,7 +199,6 @@ class ConnectionManager:
     async def send_message(self, message: Message, chat_id: Optional[str] = None) -> None:
         try:
             if not chat_id:
-                # Спочатку шукаємо існуючий чат
                 existing_chat = await self.db.get_chat_by_users(message.from_user, message.to_user)
                 if existing_chat:
                     chat_id = existing_chat['chat_id']
@@ -190,6 +215,9 @@ class ConnectionManager:
                     )
                     chat_id = chat['chat_id']
 
+            if message.from_user.startswith(('admin_', 'mechanic_')):
+                self.db.update_chat_admin(chat_id, message.from_user)
+
             await self.chat_manager.add_message_to_chat(chat_id, message)
 
             if message.to_user.startswith('telegram_'):
@@ -202,8 +230,7 @@ class ConnectionManager:
                         message.message_type
                     )
                 except Exception as e:
-                    print(f"Error sending telegram message: {str(e)}")
-                    # Спробуємо відправити хоча б текст
+
                     await self.send_telegram_message(
                         telegram_id,
                         f"{message.content} (Error sending file: {str(e)})"
@@ -229,9 +256,47 @@ class ChatManager:
             self,
             admin_id: str,
             customer_id: str,
-            title: Optional[str] = None
+            title: Optional[str] = None,
+            priority: ChatPriority = ChatPriority.NORMAL,
+            source: str = "web"
     ) -> str:
-        return await self.db.create_chat(admin_id, customer_id, title)
+        chat_id = await self.db.create_chat(
+            admin_id=admin_id,
+            customer_id=customer_id,
+            title=title,
+            priority=priority.value,
+            status=ChatStatus.NEW.value,
+            source=source
+        )
+        return chat_id
+
+    async def update_chat_status(self, chat_id: str, status: ChatStatus) -> None:
+        await self.db.update_chat(chat_id, {"status": status.value})
+
+    async def add_comment(self, chat_id: str, user_id: str, content: str) -> str:
+        comment = Comment(
+            chat_id=chat_id,
+            user_id=user_id,
+            content=content,
+            timestamp=datetime.now()
+        )
+        return await self.db.add_comment(comment.dict())
+
+    async def get_chat_comments(self, chat_id: str) -> List[dict]:
+        return await self.db.get_chat_comments(chat_id)
+
+    async def create_message_template(self, name: str, content: str, created_by: str) -> str:
+        template = ChatTemplate(
+            id=str(uuid4()),
+            name=name,
+            content=content,
+            created_by=created_by,
+            created_at=datetime.now()
+        )
+        return await self.db.create_message_template(template.dict())
+
+    async def get_message_templates(self, user_id: str) -> List[dict]:
+        return await self.db.get_message_templates(user_id)
 
     async def get_chat(self, chat_id: str) -> Optional[dict]:
         return await self.db.get_chat(chat_id)
