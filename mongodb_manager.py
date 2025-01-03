@@ -151,6 +151,16 @@ class MongoDBManager:
             traceback.print_exc()
             return []
 
+    async def get_sorted_chats(self, query: dict, sort_field: str, sort_order: int) -> List[dict]:
+        """Get chats with custom sorting"""
+        try:
+            chats = list(self.chats.find(query).sort(sort_field, sort_order))
+            return [convert_object_id(chat) for chat in chats]
+        except Exception as e:
+            print(f"Error in get_sorted_chats: {str(e)}")
+            traceback.print_exc()
+            return []
+
     async def get_chat(self, chat_id: str) -> Optional[dict]:
         """Get chat by ID"""
         chat = self.chats.find_one({"chat_id": chat_id})

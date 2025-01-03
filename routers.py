@@ -353,6 +353,53 @@ async def get_file(message_type: str, filename: str):
     return FileResponse(filepath)
 
 
+@router.get("/chats/sorted")
+async def get_sorted_chats(
+    sort_by: str = Query(..., description="Sort field: date, priority, or source"),
+    order: str = Query("desc", description="Sort order: asc or desc"),
+    api_key: Optional[str] = Header(None),
+    phone: Optional[str] = Header(None)
+):
+    user = await get_user_from_credentials(api_key=api_key, phone=phone)
+    if not user:
+        raise HTTPException(status_code=403, detail="Authentication failed")
+
+    valid_sort_fields = {
+        "date": "updated_at",
+        "priority": "priority",
+        "source": "source"
+    }
+
+    if sort_by not in valid_sort_fields:
+        raise HTTPException(status_code=400, detail="Invalid sort field")
+    if order not in ["asc", "desc"]:
+        raise HTTPException(status_code=400, detail="Invalid sort order")
+
+    try:
+        # Determine query based on user type
+        if user.type in [UserType.ADMIN, UserType.MECHANIC]:
+            query = {}  # Show all chats for admin
+        else:
+            query = {"customer_id": user.id}  # Show only user's chats for customer
+
+        # Sort chats
+        sorted_chats = await db_manager.get_sorted_chats(
+            query,
+            valid_sort_fields[sort_by],
+            -1 if order == "desc" else 1
+        )
+
+        return {
+            "status": "success",
+            "chats": sorted_chats if sorted_chats else []
+        }
+
+    except Exception as e:
+        print(f"Error in get_sorted_chats: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/chats")
 async def get_chats(
     api_key: Optional[str] = Header(None),
@@ -651,4 +698,5 @@ async def get_message_templates(
 
     templates = await chat_manager.get_message_templates(user.id)
     return {"status": "success", "templates": templates}
+
 
